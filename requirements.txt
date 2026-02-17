@@ -1,0 +1,32 @@
+# Core HTTP / Data
+httpx[http2]>=0.25.0
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Data Validation
+pydantic>=2.10.0
+
+# LLM (unified interface + providers)
+litellm>=1.40.0
+anthropic>=0.40.0
+openai>=1.50.0
+
+# Configuration
+python-dotenv>=1.0.0
+
+# Resilience
+tenacity>=8.2.0
+
+# UX
+tqdm>=4.66.0
+tabulate>=0.9.0
+
+# Kalshi SDK
+kalshi-python>=2.1.4
+
+# Notebooks & Visualization
+jupyter>=1.0.0
+matplotlib>=3.8.0
+
+# Testing
+pytest>=7.4.0

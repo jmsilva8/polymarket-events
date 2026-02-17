@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Environment / secrets
+.env
+
+# Data (cached API responses, exports, reports)
+data/cache/
+data/exports/
+reports/
