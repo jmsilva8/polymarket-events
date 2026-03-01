@@ -2,7 +2,7 @@
 Two-layer market classifier for insider risk scoring.
 
 Layer 1: Archetype lookup (free, instant)
-Layer 2: LLM classification via litellm (costs tokens, used for new market types)
+Layer 2: LLM classification via LangChain (costs tokens, used for new market types)
 """
 
 import json
@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Optional
 
 from tqdm import tqdm
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.config import CACHE_DIR
 from src.data_layer.models import UnifiedMarket
@@ -26,16 +28,25 @@ CLASSIFICATION_CACHE_DIR = CACHE_DIR / "classifications"
 CLASSIFICATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _resolve_provider(model: str) -> str:
+    """Map a model identifier to its LangChain model_provider string."""
+    if model.startswith(("gpt-", "o1-", "o3-")):
+        return "openai"
+    elif model.startswith("claude-"):
+        return "anthropic"
+    raise ValueError(f"Cannot determine provider for model: {model!r}")
+
+
 class MarketClassifier:
     """
     Classifies markets by insider risk using a two-layer approach:
       1. Check archetype library for pattern match (free)
       2. Fall back to LLM if no archetype matches
 
-    Supports multiple LLM providers via litellm.
+    Supports multiple LLM providers via LangChain init_chat_model.
     """
 
-    # litellm model identifiers
+    # Model short-name aliases
     MODELS = {
         "gpt-4o-mini": "gpt-4o-mini",
         "haiku": "claude-haiku-4-5-20251001",
@@ -49,10 +60,28 @@ class MarketClassifier:
         archetypes: Optional[ArchetypeLibrary] = None,
         cache_enabled: bool = True,
     ):
-        self.primary_model = self.MODELS.get(primary_model, primary_model)
-        self.secondary_model = self.MODELS.get(secondary_model, secondary_model) if secondary_model else None
+        self.primary_model_name = self.MODELS.get(primary_model, primary_model)
+        self.secondary_model_name = (
+            self.MODELS.get(secondary_model, secondary_model)
+            if secondary_model
+            else None
+        )
         self.archetypes = archetypes or ArchetypeLibrary()
         self.cache_enabled = cache_enabled
+
+        # Initialize LangChain chat models with structured output
+        self.primary_llm = self._init_llm(self.primary_model_name)
+        self.secondary_llm = (
+            self._init_llm(self.secondary_model_name)
+            if self.secondary_model_name
+            else None
+        )
+
+    def _init_llm(self, model: str):
+        """Create a LangChain chat model with structured output bound."""
+        provider = _resolve_provider(model)
+        base_llm = init_chat_model(model, temperature=0.1, model_provider=provider)
+        return base_llm.with_structured_output(LLMClassificationResponse)
 
     def classify(self, market: UnifiedMarket) -> MarketClassification:
         """
@@ -84,7 +113,9 @@ class MarketClassifier:
             return result
 
         # Layer 2: LLM classification
-        result = self._classify_with_llm(market, self.primary_model)
+        result = self._classify_with_llm(
+            market, self.primary_model_name, self.primary_llm
+        )
         self._save_cached(result)
         return result
 
@@ -107,8 +138,10 @@ class MarketClassifier:
                 primary = self.classify(market)
                 results.append(primary)
 
-                if run_secondary and self.secondary_model:
-                    secondary = self._classify_with_llm(market, self.secondary_model)
+                if run_secondary and self.secondary_llm:
+                    secondary = self._classify_with_llm(
+                        market, self.secondary_model_name, self.secondary_llm
+                    )
                     diff = abs(primary.insider_risk_score - secondary.insider_risk_score)
                     if diff >= 2:
                         disagreements.append({
@@ -139,11 +172,9 @@ class MarketClassifier:
         return results
 
     def _classify_with_llm(
-        self, market: UnifiedMarket, model: str
+        self, market: UnifiedMarket, model_name: str, llm
     ) -> MarketClassification:
-        """Call the LLM to classify a market from scratch."""
-        import litellm
-
+        """Call the LLM to classify a market using structured output."""
         tags_str = ", ".join(t.label for t in market.tags) or market.category or "N/A"
         end_date_str = market.end_date.isoformat() if market.end_date else "Unknown"
 
@@ -155,37 +186,13 @@ class MarketClassifier:
             end_date=end_date_str,
         )
 
-        response = litellm.completion(
-            model=model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_tokens=400,
-            temperature=0.1,
-            response_format={"type": "json_object"} if "gpt" in model else None,
-        )
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_prompt),
+        ]
 
-        raw_text = response.choices[0].message.content.strip()
-
-        # Strip markdown code fences if present
-        if raw_text.startswith("```"):
-            raw_text = raw_text.split("\n", 1)[-1]
-            if raw_text.endswith("```"):
-                raw_text = raw_text[:-3]
-            raw_text = raw_text.strip()
-
-        parsed = LLMClassificationResponse(**json.loads(raw_text))
-
-        # Determine model display name
-        if "gpt-4o-mini" in model:
-            model_name = "gpt-4o-mini"
-        elif "haiku" in model:
-            model_name = "claude-haiku-4.5"
-        elif "sonnet" in model:
-            model_name = "claude-sonnet-4.5"
-        else:
-            model_name = model
+        # .invoke() returns a validated LLMClassificationResponse directly
+        parsed: LLMClassificationResponse = llm.invoke(messages)
 
         return MarketClassification(
             market_id=market.market_id,
@@ -197,8 +204,19 @@ class MarketClassifier:
             reasoning=parsed.reasoning,
             info_holders=parsed.info_holders,
             leak_vectors=parsed.leak_vectors,
-            model_used=model_name,
+            model_used=self._display_name(model_name),
         )
+
+    @staticmethod
+    def _display_name(model: str) -> str:
+        """Convert a model identifier to a human-readable display name."""
+        if "gpt-4o-mini" in model:
+            return "gpt-4o-mini"
+        elif "haiku" in model:
+            return "claude-haiku-4.5"
+        elif "sonnet" in model:
+            return "claude-sonnet-4.5"
+        return model
 
     # ── Cache ──────────────────────────────────────────────────────
 

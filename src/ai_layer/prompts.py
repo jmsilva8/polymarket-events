@@ -29,19 +29,7 @@ Score based on these factors:
 | 7 | Product launch date/features | Company employees and partners know weeks/months ahead |
 | 8 | Halftime show setlist / Reality TV elimination | Performers/crew/producers all know; pre-recorded |
 | 9 | Super Bowl specific ads | Ad buyers, agencies, network sales teams all know well in advance |
-| 10 | Regulatory rulings pre-announcement | Small group knows, massive financial incentive to leak |
-
-## Output Format
-
-Respond with ONLY valid JSON (no markdown, no code fences):
-{
-  "insider_risk_score": <1-10>,
-  "confidence": "<high|medium|low>",
-  "reasoning": "<1-2 sentence explanation>",
-  "info_holders": ["<group1>", "<group2>"],
-  "leak_vectors": ["<vector1>", "<vector2>"],
-  "suggested_archetype": "<snake_case name if this is a reusable category, else null>"
-}"""
+| 10 | Regulatory rulings pre-announcement | Small group knows, massive financial incentive to leak |"""
 
 USER_PROMPT_TEMPLATE = """\
 Classify this prediction market for insider risk:

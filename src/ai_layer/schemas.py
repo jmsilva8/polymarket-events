@@ -40,16 +40,30 @@ class MarketClassification(BaseModel):
 
 class LLMClassificationResponse(BaseModel):
     """
-    The JSON schema we ask the LLM to produce.
-    A subset of MarketClassification — we fill in the rest ourselves.
+    Structured classification output from the LLM.
+    Used with LangChain's .with_structured_output() — field descriptions
+    are passed to the model as part of the JSON Schema.
     """
 
-    insider_risk_score: int = Field(ge=1, le=10)
-    confidence: str = Field(description="high | medium | low")
-    reasoning: str
-    info_holders: list[str] = Field(default_factory=list)
-    leak_vectors: list[str] = Field(default_factory=list)
+    insider_risk_score: int = Field(
+        ge=1, le=10,
+        description="Insider risk score from 1 (no insider edge) to 10 (extreme insider advantage)",
+    )
+    confidence: str = Field(
+        description="Confidence level: 'high', 'medium', or 'low'",
+    )
+    reasoning: str = Field(
+        description="1-2 sentence explanation for the assigned score",
+    )
+    info_holders: list[str] = Field(
+        default_factory=list,
+        description="Groups who may have advance knowledge (e.g. 'academy voters', 'show producers')",
+    )
+    leak_vectors: list[str] = Field(
+        default_factory=list,
+        description="How information could leak to markets (e.g. 'social media', 'betting line shifts')",
+    )
     suggested_archetype: Optional[str] = Field(
         None,
-        description="If this looks like a reusable category, suggest an archetype name (e.g. 'reality_tv_elimination')",
+        description="If this looks like a reusable category, suggest a snake_case archetype name (e.g. 'reality_tv_elimination'), else null",
     )
