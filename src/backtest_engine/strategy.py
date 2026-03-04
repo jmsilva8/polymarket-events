@@ -15,10 +15,16 @@ class StrategyParams:
     min_leak_score: int = 7            # Minimum insider risk score to trade
     min_volume: float = 10_000.0       # Minimum market volume
 
-    # Abnormal movement filter: price must have risen by at least this many
-    # points from the last price before the window to the signal price.
+    # Abnormal movement filter (absolute): price must have risen by at least
+    # this many points from the last price before the window to the signal price.
     # None = disabled (any price >= price_threshold triggers).
     min_price_jump: Optional[float] = None
+
+    # Abnormal movement filter (relative): price must have risen by at least
+    # this fraction relative to the reference price, e.g. 0.10 = +10%.
+    # Scale-free alternative to min_price_jump — a 10% move means the same
+    # at any price level.  None = disabled.  Both filters can be active at once.
+    min_relative_jump: Optional[float] = None
 
     # Baseline mode: ignore the hours_before_close window and search the
     # entire price history.  Used for the "always-bet-the-favourite" baselines.
@@ -49,10 +55,12 @@ class InsiderAlphaStrategy:
     the market's end date, that's a potential insider signal. We buy YES at
     that price.
 
-    Optionally, `min_price_jump` enforces an abnormal-movement filter: the
-    price must have risen by at least that many points from the last observed
-    price before the window.  This distinguishes markets that were already
-    high from markets that moved sharply just before close.
+    Optionally, `min_price_jump` and/or `min_relative_jump` enforce an
+    abnormal-movement filter: the price must have risen by at least the given
+    absolute points / relative fraction from the last observed price before
+    the window.  This distinguishes markets that were already high from
+    markets that moved sharply just before close.  Both filters can be active
+    simultaneously — both must be satisfied for a signal to fire.
 
     P&L:
     - If resolved YES:  profit = 1.0 - entry_price
@@ -106,10 +114,10 @@ class InsiderAlphaStrategy:
         else:
             window_start = end_date - timedelta(hours=self.params.hours_before_close)
 
-        # If min_price_jump is set, find the reference price just before the
+        # If any jump filter is set, find the reference price just before the
         # window (data is sorted, so we break as soon as we enter the window).
         window_entry_price: Optional[float] = None
-        if self.params.min_price_jump is not None:
+        if self.params.min_price_jump is not None or self.params.min_relative_jump is not None:
             for dp in price_history.data_points:
                 ts = dp.timestamp
                 if ts.tzinfo is None:
@@ -131,14 +139,18 @@ class InsiderAlphaStrategy:
                 break  # data is sorted; nothing further can match
 
             if dp.price >= self.params.price_threshold:
-                # Check abnormal-movement filter if enabled
-                if self.params.min_price_jump is not None:
-                    # Reference is the last price before the window; if none
-                    # exists (market opened inside the window) use the current
-                    # price so the jump condition passes.
+                # Check abnormal-movement filters if enabled.
+                # Reference is the last price before the window; if none
+                # exists (market opened inside the window) use the current
+                # price so the jump is zero and the condition fails.
+                if self.params.min_price_jump is not None or self.params.min_relative_jump is not None:
                     ref = window_entry_price if window_entry_price is not None else dp.price
-                    if dp.price - ref < self.params.min_price_jump:
-                        continue  # not enough movement yet; keep scanning
+                    if self.params.min_price_jump is not None:
+                        if dp.price - ref < self.params.min_price_jump:
+                            continue  # not enough absolute movement; keep scanning
+                    if self.params.min_relative_jump is not None and ref > 0:
+                        if (dp.price - ref) / ref < self.params.min_relative_jump:
+                            continue  # not enough relative movement; keep scanning
 
                 hours_before = (end_date - ts).total_seconds() / 3600.0
 

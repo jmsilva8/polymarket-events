@@ -24,6 +24,8 @@ DEFAULT_HOURS_BEFORE_CLOSE = [6, 12, 24, 48, 72]
 DEFAULT_MIN_LEAK_SCORES = [5, 6, 7, 8, 9]
 # None = no jump requirement (pure threshold); values add the abnormal-movement filter
 DEFAULT_MIN_PRICE_JUMPS: list[Optional[float]] = [None, 0.05, 0.10, 0.15]
+# None = disabled; values are minimum relative (fractional) moves, e.g. 0.10 = +10%
+DEFAULT_MIN_RELATIVE_JUMPS: list[Optional[float]] = [None]
 
 
 class BacktestRunner:
@@ -272,6 +274,7 @@ class BacktestRunner:
         hours_before_close: Optional[list[float]] = None,
         min_leak_scores: Optional[list[int]] = None,
         min_price_jumps: Optional[list[Optional[float]]] = None,
+        min_relative_jumps: Optional[list[Optional[float]]] = None,
         ignore_window: bool = False,
         strategy_type_label: str = "insider_alpha",
         verbose: bool = True,
@@ -284,8 +287,11 @@ class BacktestRunner:
             hours_before_close: List of window sizes (hours) to sweep.
                 Ignored when ignore_window=True.
             min_leak_scores: List of minimum insider risk scores to sweep.
-            min_price_jumps: List of minimum price-jump values to sweep.
-                None entries disable the jump filter for that combo.
+            min_price_jumps: List of minimum absolute price-jump values to sweep.
+                None entries disable the absolute jump filter for that combo.
+            min_relative_jumps: List of minimum relative price-jump values to sweep
+                (e.g. 0.10 = +10% move required).  None entries disable the filter.
+                Defaults to [None] so existing sweeps are unaffected.
             ignore_window: If True, search entire price history (baseline B mode).
             strategy_type_label: Label written to the ``strategy_type`` column.
             verbose: Show tqdm progress bar.
@@ -297,20 +303,22 @@ class BacktestRunner:
         hbc = hours_before_close or DEFAULT_HOURS_BEFORE_CLOSE
         mls = min_leak_scores or DEFAULT_MIN_LEAK_SCORES
         mpjs = min_price_jumps if min_price_jumps is not None else DEFAULT_MIN_PRICE_JUMPS
+        mrjs = min_relative_jumps if min_relative_jumps is not None else DEFAULT_MIN_RELATIVE_JUMPS
 
-        combos = list(product(pts, hbc, mls, mpjs))
+        combos = list(product(pts, hbc, mls, mpjs, mrjs))
         if verbose:
             print(f"Running {len(combos)} parameter combinations [{strategy_type_label}]...")
 
         all_metrics: list[dict] = []
 
         iterator = tqdm(combos, desc=strategy_type_label) if verbose else combos
-        for pt, h, ms, mpj in iterator:
+        for pt, h, ms, mpj, mrj in iterator:
             params = StrategyParams(
                 price_threshold=pt,
                 hours_before_close=h,
                 min_leak_score=ms,
                 min_price_jump=mpj,
+                min_relative_jump=mrj,
                 ignore_window=ignore_window,
             )
             signals, metrics = self.run_single(params)
@@ -320,6 +328,7 @@ class BacktestRunner:
                 "hours_before_close": h if not ignore_window else None,
                 "min_leak_score": ms,
                 "min_price_jump": mpj,
+                "min_relative_jump": mrj,
                 "total_signals": metrics.total_signals,
                 "wins": metrics.wins,
                 "losses": metrics.losses,
