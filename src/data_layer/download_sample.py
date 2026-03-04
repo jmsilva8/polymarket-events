@@ -9,6 +9,7 @@ Usage:
 import sys
 import logging
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -22,26 +23,33 @@ from src.data_layer.models import UnifiedMarket, UnifiedEvent
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
+# Only include markets that closed on or after this date.
+# Kalshi only got retail approval in late 2023; pre-2024 data is thin on both platforms.
+CUTOFF_DATE = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
 
 def download_polymarket_all(client: PolymarketClient) -> list[UnifiedEvent]:
-    """Fetch ALL closed events across all categories."""
-    logger.info("Fetching closed Polymarket events (all categories)...")
-    all_closed = client.get_all_closed_events(max_pages=100)
+    """Fetch closed events (all categories) since CUTOFF_DATE."""
+    logger.info("Fetching closed Polymarket events since %s...", CUTOFF_DATE.date())
+    all_closed = client.get_all_closed_events(
+        max_pages=100,
+        end_date_min=CUTOFF_DATE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
     logger.info("Total closed events: %d", len(all_closed))
     return all_closed
 
 
 def download_kalshi_all(client: KalshiClient) -> list[UnifiedMarket]:
     """
-    Fetch all settled Kalshi markets across all categories.
-    Category is on the event level, so we fetch all settled events
-    then fetch markets for each.
+    Fetch settled Kalshi markets (all categories) since CUTOFF_DATE.
+    The Kalshi events endpoint has no date filter, so we fetch all settled
+    events, then filter markets by closed_at after fetching.
     """
     logger.info("Fetching settled Kalshi events...")
     all_events = client.get_all_closed_events(max_pages=50)
     logger.info("Total settled Kalshi events: %d", len(all_events))
 
-    # Fetch markets for all events
+    # Fetch markets for all events, then filter by close date
     all_markets: list[UnifiedMarket] = []
     for event in all_events:
         try:
@@ -50,11 +58,16 @@ def download_kalshi_all(client: KalshiClient) -> list[UnifiedMarket]:
             for m in markets:
                 m.category = event.category
                 m.event_title = event.title
+            # Drop markets that closed before the cutoff (closed_at=None means keep)
+            markets = [
+                m for m in markets
+                if m.closed_at is None or m.closed_at >= CUTOFF_DATE
+            ]
             all_markets.extend(markets)
         except Exception as e:
             logger.warning("Failed to fetch markets for %s: %s", event.event_id, e)
 
-    logger.info("Total Kalshi markets: %d", len(all_markets))
+    logger.info("Total Kalshi markets since %s: %d", CUTOFF_DATE.date(), len(all_markets))
     return all_markets
 
 
@@ -119,9 +132,10 @@ def print_cost_report(
     print("=" * 70)
 
     print("\n[DATA] DATA SUMMARY")
-    print(f"  Polymarket events (all categories):  {len(poly_events)}")
-    print(f"  Polymarket markets (all categories): {len(poly_markets)}")
-    print(f"  Kalshi markets (all categories):     {len(kalshi_markets)}")
+    print(f"  Date range:  {CUTOFF_DATE.date()} → present (all categories)")
+    print(f"  Polymarket events:  {len(poly_events)}")
+    print(f"  Polymarket markets: {len(poly_markets)}")
+    print(f"  Kalshi markets:     {len(kalshi_markets)}")
     print(f"  Total markets across platforms:   {len(poly_markets) + len(kalshi_markets)}")
 
     # Volume filtering
