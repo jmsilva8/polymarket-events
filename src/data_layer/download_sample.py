@@ -34,6 +34,7 @@ def download_polymarket_all(client: PolymarketClient) -> list[UnifiedEvent]:
     all_closed = client.get_all_closed_events(
         max_pages=100,
         end_date_min=CUTOFF_DATE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        volume_min=MIN_VOLUME_USD,
     )
     logger.info("Total closed events: %d", len(all_closed))
     return all_closed

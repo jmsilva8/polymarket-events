@@ -106,6 +106,7 @@ class PolymarketClient(BaseMarketClient):
         tag_id: Optional[int] = None,
         end_date_min: Optional[str] = None,
         end_date_max: Optional[str] = None,
+        volume_min: Optional[float] = None,
     ) -> list[UnifiedEvent]:
         params: dict = {
             "closed": "true",
@@ -120,6 +121,8 @@ class PolymarketClient(BaseMarketClient):
             params["end_date_min"] = end_date_min
         if end_date_max:
             params["end_date_max"] = end_date_max
+        if volume_min is not None:
+            params["volume_num_min"] = volume_min
         raw = self._gamma_get("/events", params)
         return [self._parse_event(e) for e in raw]
 
@@ -134,6 +137,7 @@ class PolymarketClient(BaseMarketClient):
         tag_id: Optional[int] = None,
         end_date_min: Optional[str] = None,
         end_date_max: Optional[str] = None,
+        volume_min: Optional[float] = None,
         max_pages: int = 100,
     ) -> list[UnifiedEvent]:
         """Auto-paginate through all closed events."""
@@ -142,6 +146,7 @@ class PolymarketClient(BaseMarketClient):
             tag_id=tag_id,
             end_date_min=end_date_min,
             end_date_max=end_date_max,
+            volume_min=volume_min,
             max_pages=max_pages,
         )
 
