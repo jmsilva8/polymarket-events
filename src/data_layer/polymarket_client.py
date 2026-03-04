@@ -139,8 +139,14 @@ class PolymarketClient(BaseMarketClient):
         end_date_max: Optional[str] = None,
         volume_min: Optional[float] = None,
         max_pages: int = 100,
+        cache_key: Optional[str] = None,
     ) -> list[UnifiedEvent]:
-        """Auto-paginate through all closed events."""
+        """Auto-paginate through all closed events.
+
+        If cache_key is provided, each page is saved to disk on first fetch and
+        loaded from disk on subsequent runs — making downloads resumable.
+        Delete data/cache/events/<cache_key>_page_*.json to force a fresh fetch.
+        """
         return self._paginate(
             self.get_closed_events,
             tag_id=tag_id,
@@ -148,16 +154,41 @@ class PolymarketClient(BaseMarketClient):
             end_date_max=end_date_max,
             volume_min=volume_min,
             max_pages=max_pages,
+            cache_key=cache_key,
         )
 
-    def _paginate(self, fetch_fn, max_pages: int = 50, **kwargs) -> list[UnifiedEvent]:
+    def clear_page_cache(self, cache_key: str) -> int:
+        """Delete all per-page cache files for the given key. Returns count deleted."""
+        pages = list((self.cache_dir / "events").glob(f"{cache_key}_page_*.json"))
+        for p in pages:
+            p.unlink()
+        logger.info("Cleared %d cached pages for '%s'", len(pages), cache_key)
+        return len(pages)
+
+    def _paginate(self, fetch_fn, max_pages: int = 50, cache_key: Optional[str] = None, **kwargs) -> list[UnifiedEvent]:
         all_events: list[UnifiedEvent] = []
         page_size = 100
         for page in range(max_pages):
-            events = fetch_fn(limit=page_size, offset=page * page_size, **kwargs)
+            page_path = (
+                self.cache_dir / "events" / f"{cache_key}_page_{page:04d}.json"
+                if cache_key and self.cache_enabled
+                else None
+            )
+
+            if page_path and page_path.exists():
+                raw_page = json.loads(page_path.read_text())
+                events = [self._parse_event(e) for e in raw_page]
+                logger.debug("Page %d: loaded %d events from cache", page, len(events))
+            else:
+                events = fetch_fn(limit=page_size, offset=page * page_size, **kwargs)
+                if page_path and events:
+                    raw_page = [e.raw_data for e in events if e.raw_data]
+                    page_path.write_text(json.dumps(raw_page))
+
             all_events.extend(events)
             if len(events) < page_size:
                 break
+
         logger.info("Fetched %d events total", len(all_events))
         return all_events
 
