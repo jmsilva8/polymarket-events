@@ -34,6 +34,8 @@ def download_polymarket_all(client: PolymarketClient) -> list[UnifiedEvent]:
     all_closed = client.get_all_closed_events(
         max_pages=100,
         end_date_min=CUTOFF_DATE.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        volume_min=MIN_VOLUME_USD,
+        cache_key="polymarket_closed",
     )
     logger.info("Total closed events: %d", len(all_closed))
     return all_closed
@@ -207,7 +209,7 @@ def main():
         # Cache and export
         cache.cache_events(poly_events, "polymarket_all_closed")
         if poly_markets:
-            cache.export_markets_csv(poly_markets, "polymarket_all_sample")
+            cache.export_markets_parquet(poly_markets, "polymarket_all_sample")
 
     # ── Kalshi ──────────────────────────────────────────────────
     logger.info("\n=== KALSHI ===")
@@ -215,7 +217,7 @@ def main():
         kalshi_markets = download_kalshi_all(kalshi)
 
         if kalshi_markets:
-            cache.export_markets_csv(kalshi_markets, "kalshi_all_sample")
+            cache.export_markets_parquet(kalshi_markets, "kalshi_all_sample")
 
     # ── Combine & estimate costs ────────────────────────────────
     all_markets = poly_markets + kalshi_markets

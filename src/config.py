@@ -40,7 +40,7 @@ POLYMARKET_ENABLED = os.getenv("POLYMARKET_ENABLED", "true").lower() == "true"
 KALSHI_ENABLED = os.getenv("KALSHI_ENABLED", "true").lower() == "true"
 
 # ── Filters ────────────────────────────────────────────────────────
-MIN_VOLUME_USD = 10_000  # Only classify markets above this volume
+MIN_VOLUME_USD = 20_000  # Only classify markets above this volume
 
 # Polymarket event-level tag labels used to identify entertainment/pop-culture
 # markets.  These are matched against the tag "label" field (case-insensitive).

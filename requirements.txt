@@ -2,6 +2,7 @@
 httpx[http2]>=0.25.0
 pandas>=2.1.0
 numpy>=1.26.0
+pyarrow>=14.0.0
 
 # Data Validation
 pydantic>=2.10.0
