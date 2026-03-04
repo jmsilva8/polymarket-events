@@ -8,7 +8,7 @@ import pandas as pd
 
 # Load cached events
 data = json.loads(
-    Path("data/cache/events/polymarket_entertainment_closed.json").read_text()
+    Path("data/cache/events/polymarket_all_closed.json").read_text()
 )
 print(f"Cached events: {len(data)}")
 

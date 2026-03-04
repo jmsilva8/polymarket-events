@@ -1,5 +1,5 @@
 """
-Download entertainment/culture market data from both platforms.
+Download all closed market data from both platforms (all categories).
 Generates a cost estimation report before any LLM calls.
 
 Usage:
@@ -23,37 +23,27 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def download_polymarket_entertainment(client: PolymarketClient) -> list[UnifiedEvent]:
-    """Fetch ALL closed events, then filter to entertainment/culture."""
+def download_polymarket_all(client: PolymarketClient) -> list[UnifiedEvent]:
+    """Fetch ALL closed events across all categories."""
     logger.info("Fetching closed Polymarket events (all categories)...")
     all_closed = client.get_all_closed_events(max_pages=100)
     logger.info("Total closed events: %d", len(all_closed))
-
-    entertainment = client.filter_entertainment_events(all_closed)
-    logger.info("Entertainment events after tag filter: %d", len(entertainment))
-    return entertainment
+    return all_closed
 
 
-def download_kalshi_entertainment(client: KalshiClient) -> list[UnifiedMarket]:
+def download_kalshi_all(client: KalshiClient) -> list[UnifiedMarket]:
     """
-    Fetch Kalshi entertainment markets.
-    Category is on the event level, so we first fetch all settled events,
-    filter by Entertainment category, then fetch markets for each.
+    Fetch all settled Kalshi markets across all categories.
+    Category is on the event level, so we fetch all settled events
+    then fetch markets for each.
     """
     logger.info("Fetching settled Kalshi events...")
     all_events = client.get_all_closed_events(max_pages=50)
     logger.info("Total settled Kalshi events: %d", len(all_events))
 
-    # Filter by Entertainment category
-    ent_events = [
-        e for e in all_events
-        if (e.category or "").lower() in ("entertainment", "culture")
-    ]
-    logger.info("Kalshi entertainment events: %d", len(ent_events))
-
-    # Fetch markets for each entertainment event
+    # Fetch markets for all events
     all_markets: list[UnifiedMarket] = []
-    for event in ent_events:
+    for event in all_events:
         try:
             markets = client.get_markets_for_event(event.event_id)
             # Tag each market with its parent event's category
@@ -64,7 +54,7 @@ def download_kalshi_entertainment(client: KalshiClient) -> list[UnifiedMarket]:
         except Exception as e:
             logger.warning("Failed to fetch markets for %s: %s", event.event_id, e)
 
-    logger.info("Kalshi entertainment markets: %d", len(all_markets))
+    logger.info("Total Kalshi markets: %d", len(all_markets))
     return all_markets
 
 
@@ -129,9 +119,9 @@ def print_cost_report(
     print("=" * 70)
 
     print("\n[DATA] DATA SUMMARY")
-    print(f"  Polymarket entertainment events:  {len(poly_events)}")
-    print(f"  Polymarket entertainment markets: {len(poly_markets)}")
-    print(f"  Kalshi entertainment markets:     {len(kalshi_markets)}")
+    print(f"  Polymarket events (all categories):  {len(poly_events)}")
+    print(f"  Polymarket markets (all categories): {len(poly_markets)}")
+    print(f"  Kalshi markets (all categories):     {len(kalshi_markets)}")
     print(f"  Total markets across platforms:   {len(poly_markets) + len(kalshi_markets)}")
 
     # Volume filtering
@@ -197,21 +187,21 @@ def main():
     # ── Polymarket ──────────────────────────────────────────────
     logger.info("=== POLYMARKET ===")
     with PolymarketClient() as poly:
-        poly_events = download_polymarket_entertainment(poly)
+        poly_events = download_polymarket_all(poly)
         poly_markets = [m for e in poly_events for m in e.markets]
 
         # Cache and export
-        cache.cache_events(poly_events, "polymarket_entertainment_closed")
+        cache.cache_events(poly_events, "polymarket_all_closed")
         if poly_markets:
-            cache.export_markets_csv(poly_markets, "polymarket_entertainment_sample")
+            cache.export_markets_csv(poly_markets, "polymarket_all_sample")
 
     # ── Kalshi ──────────────────────────────────────────────────
     logger.info("\n=== KALSHI ===")
     with KalshiClient(use_auth=False) as kalshi:
-        kalshi_markets = download_kalshi_entertainment(kalshi)
+        kalshi_markets = download_kalshi_all(kalshi)
 
         if kalshi_markets:
-            cache.export_markets_csv(kalshi_markets, "kalshi_entertainment_sample")
+            cache.export_markets_csv(kalshi_markets, "kalshi_all_sample")
 
     # ── Combine & estimate costs ────────────────────────────────
     all_markets = poly_markets + kalshi_markets
