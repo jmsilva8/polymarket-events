@@ -13,8 +13,8 @@ from src.graph import build_classification_graph
 graph = build_classification_graph()
 
 final_state = graph.invoke({
-    "polymarket_csv": "data/exports/polymarket_entertainment_sample.csv",
-    "kalshi_csv": "data/exports/kalshi_entertainment_sample.csv",
+    "polymarket_csv": "data/exports/polymarket_all_sample.csv",
+    "kalshi_csv": "data/exports/kalshi_all_sample.csv",
     "volume_threshold": 10_000,
     "primary_model": "gpt-4o-mini",
     "secondary_model": "haiku",
