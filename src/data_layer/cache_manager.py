@@ -61,6 +61,7 @@ class CacheManager:
                 "start_date": m.start_date,
                 "end_date": m.end_date,
                 "tags": "|".join(t.label for t in m.tags),
+                "clob_token_ids": "|".join(m.clob_token_ids),
             }
             for m in markets
         ]
