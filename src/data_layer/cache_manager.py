@@ -20,6 +20,8 @@ class CacheManager:
     ):
         self.cache_dir = cache_dir
         self.exports_dir = exports_dir
+        (cache_dir / "events").mkdir(parents=True, exist_ok=True)
+        exports_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Events JSON ────────────────────────────────────────────────
 

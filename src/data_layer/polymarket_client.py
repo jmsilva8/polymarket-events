@@ -183,6 +183,7 @@ class PolymarketClient(BaseMarketClient):
                 events = fetch_fn(limit=page_size, offset=page * page_size, **kwargs)
                 if page_path and events:
                     raw_page = [e.raw_data for e in events if e.raw_data]
+                    page_path.parent.mkdir(parents=True, exist_ok=True)
                     page_path.write_text(json.dumps(raw_page))
 
             all_events.extend(events)
