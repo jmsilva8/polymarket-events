@@ -438,25 +438,26 @@ def run_decision(state: MultiAgentState) -> dict:
     det_params = DecisionAgentParams(
         model_name=state.get("decision_model", "gpt-4o-mini")
     )
+    max_workers = state.get("max_workers", 20)
     now = datetime.now(timezone.utc)
     compare = state.get("compare_decision_methods", False)
 
-    decision_outputs: dict[str, dict] = {}
-    decision_outputs_llm: dict[str, dict] = {}
+    def _error_fallback(mid, rev, e):
+        return {
+            "market_id": mid,
+            "decision": "SKIP",
+            "bet_direction": "null",
+            "full_reasoning": f"Decision Agent error: {e}",
+            "revision_flag_applied": rev.get("revision_flag", "NONE"),
+            "recommendation": {"action": "PASS"},
+            "evaluation_date": now.isoformat(),
+        }
 
-    _error_fallback = lambda mid, rev, e: {
-        "market_id": mid,
-        "decision": "SKIP",
-        "bet_direction": "null",
-        "full_reasoning": f"Decision Agent error: {e}",
-        "revision_flag_applied": rev.get("revision_flag", "NONE"),
-        "recommendation": {"action": "PASS"},
-        "evaluation_date": now.isoformat(),
-    }
-
-    for market in state["filtered_markets"]:
+    def _process_one_decision(market):
         mid = market.market_id
         rev = state["revision_outputs"].get(mid, {})
+        det_result = None
+        llm_result = None
 
         try:
             package = DecisionAgentInputPackage(
@@ -474,22 +475,31 @@ def run_decision(state: MultiAgentState) -> dict:
                 market_id=mid,
             )
 
-            # Primary: deterministic (always runs)
-            det_output = decision_agent_deterministic(package, det_params)
-            decision_outputs[mid] = det_output.model_dump()
+            det_result = decision_agent_deterministic(package, det_params).model_dump()
 
-            # Comparison: LLM-based (optional)
             if compare:
                 try:
-                    llm_output = decision_agent(package, det_params)
-                    decision_outputs_llm[mid] = llm_output.model_dump()
+                    llm_result = decision_agent(package, det_params).model_dump()
                 except Exception as e:
                     logger.error("LLM Decision Agent failed for %s: %s", mid, e)
-                    decision_outputs_llm[mid] = _error_fallback(mid, rev, e)
+                    llm_result = _error_fallback(mid, rev, e)
 
         except Exception as e:
             logger.error("Decision Agent failed for %s: %s", mid, e)
-            decision_outputs[mid] = _error_fallback(mid, rev, e)
+            det_result = _error_fallback(mid, rev, e)
+
+        return mid, det_result, llm_result
+
+    decision_outputs: dict[str, dict] = {}
+    decision_outputs_llm: dict[str, dict] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for mid, det_result, llm_result in executor.map(
+            _process_one_decision, state["filtered_markets"]
+        ):
+            decision_outputs[mid] = det_result
+            if llm_result is not None:
+                decision_outputs_llm[mid] = llm_result
 
     logger.info(
         "Decision node complete: %d markets (LLM comparison: %s)",
