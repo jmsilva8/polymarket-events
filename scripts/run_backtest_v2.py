@@ -49,14 +49,13 @@ from src.ai_layer.agent_a.params import AgentAParams
 from src.ai_layer.agent_a.schemas import AgentAInputPackage, _LLMClassificationResponse
 from src.ai_layer.agent_b.agent import agent_b_initial
 from src.ai_layer.agent_b.params import AgentBParams
-from src.ai_layer.agent_b.schemas import AgentBInputPackage, AgentBReport
-from src.ai_layer.revision_agent import revision_agent, RevisionAgentOutput
+from src.ai_layer.agent_b.schemas import AgentBInputPackage, AgentBReport, _LLMAgentBResponse
+from src.ai_layer.revision_agent import revision_agent_deterministic, RevisionAgentOutput
 from src.ai_layer.decision_agent.agent import decision_agent_deterministic, decision_agent
 from src.ai_layer.decision_agent.params import DecisionAgentParams
 from src.ai_layer.decision_agent.schemas import DecisionAgentInputPackage
 
-from langchain.chat_models import init_chat_model
-from langchain_core.callbacks import BaseCallbackHandler
+import httpx
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -102,7 +101,7 @@ logger = logging.getLogger(__name__)
 
 # ── Cost tracking ─────────────────────────────────────────────────────────────
 
-class CostTracker(BaseCallbackHandler):
+class CostTracker:
     """Thread-safe cumulative token/cost tracker for OpenAI LLM calls."""
 
     # gpt-4o-mini pricing ($/1M tokens)
@@ -117,11 +116,11 @@ class CostTracker(BaseCallbackHandler):
         self._stage_snapshots: dict[str, tuple[int, int, int]] = {}
         self._stage_costs: list[tuple[str, int, float]] = []  # (name, calls, cost)
 
-    def on_llm_end(self, response, **kwargs):
-        usage = (response.llm_output or {}).get("token_usage", {})
+    def record(self, prompt_tokens: int, completion_tokens: int):
+        """Record token usage from one LLM call (thread-safe)."""
         with self._lock:
-            self.input_tokens += usage.get("prompt_tokens", 0)
-            self.output_tokens += usage.get("completion_tokens", 0)
+            self.input_tokens += prompt_tokens
+            self.output_tokens += completion_tokens
             self.calls += 1
 
     @property
@@ -148,6 +147,14 @@ class CostTracker(BaseCallbackHandler):
             stage, d_calls, d_in // 1000, d_out // 1000, d_cost, self.cost,
         )
 
+    def merge_from(self, other: "CostTracker", stage_name: str):
+        """Merge another tracker's totals into this one and log the stage."""
+        with self._lock:
+            self.input_tokens += other.input_tokens
+            self.output_tokens += other.output_tokens
+            self.calls += other.calls
+        self._stage_costs.append((stage_name, other.calls, other.cost))
+
     def print_summary(self):
         """Print a final cost summary table."""
         SEP = "=" * 60
@@ -159,6 +166,123 @@ class CostTracker(BaseCallbackHandler):
         print("-" * 60)
         print(f"  {'TOTAL':<16} {self.calls:>5} calls | ${self.cost:.4f}")
         print(f"{SEP}")
+
+
+# ── Httpx-based LLM (bypasses OpenAI SDK — hangs on Python 3.14) ─────────────
+
+class HttpxStructuredLLM:
+    """
+    Lightweight OpenAI chat completion client using httpx directly.
+
+    The OpenAI Python SDK v2.24.0 hangs indefinitely on Python 3.14.
+    Raw httpx works fine, so this class bypasses the SDK entirely.
+
+    Provides .invoke(messages) → Pydantic model, matching the interface
+    that agents expect from LangChain's .with_structured_output().
+    """
+
+    API_URL = "https://api.openai.com/v1/chat/completions"
+
+    def __init__(
+        self,
+        schema: type,
+        model: str = "gpt-4o-mini",
+        temperature: float = 0,
+        timeout: float = 30.0,
+        cost_tracker: CostTracker | None = None,
+    ):
+        import os
+        self._schema = schema
+        self._model = model
+        self._temperature = temperature
+        self._timeout = timeout
+        self._cost_tracker = cost_tracker
+        self._api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not self._api_key:
+            raise ValueError("OPENAI_API_KEY not set")
+        # Shared httpx client (thread-safe)
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(timeout, connect=10.0),
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        # Use json_object mode (avoids strict schema compatibility issues)
+        self._response_format = {"type": "json_object"}
+        # Build human-readable schema instruction from Pydantic model
+        self._schema_instruction = self._build_schema_instruction(schema)
+
+    @staticmethod
+    def _build_schema_instruction(schema: type) -> str:
+        """Generate readable field descriptions from a Pydantic model."""
+        s = schema.model_json_schema()
+        lines = ["Respond with a JSON object containing exactly these fields:"]
+        for name, prop in s.get("properties", {}).items():
+            typ = prop.get("type", "")
+            enum = prop.get("enum")
+            if enum:
+                lines.append(f'- {name}: one of {", ".join(repr(e) for e in enum)}')
+            elif typ == "array":
+                item_type = prop.get("items", {}).get("type", "string")
+                lines.append(f"- {name}: list of {item_type}s")
+            elif typ == "integer":
+                lines.append(f"- {name}: integer")
+            elif typ == "object":
+                lines.append(f"- {name}: object (dict)")
+            else:
+                lines.append(f"- {name}: {typ}")
+            # Add description if available
+            desc = prop.get("description")
+            if desc:
+                lines[-1] += f" — {desc}"
+        # Handle nested $defs (e.g. FeedbackMessage in RevisionAgentOutput)
+        defs = s.get("$defs", {})
+        for def_name, def_schema in defs.items():
+            lines.append(f"\n{def_name} object fields:")
+            for pname, pprop in def_schema.get("properties", {}).items():
+                penum = pprop.get("enum")
+                if penum:
+                    lines.append(f'  - {pname}: one of {", ".join(repr(e) for e in penum)}')
+                else:
+                    lines.append(f"  - {pname}: {pprop.get('type', 'string')}")
+        return "\n".join(lines)
+
+    def invoke(self, messages: list[dict]) -> object:
+        """Call OpenAI API and return parsed Pydantic model."""
+        # Inject readable schema instruction so the LLM knows the
+        # exact JSON fields to produce (json_object mode only forces
+        # JSON output, it doesn't enforce a schema).
+        patched = list(messages)
+        if patched and patched[0].get("role") == "system":
+            patched[0] = {
+                **patched[0],
+                "content": patched[0]["content"] + "\n\n" + self._schema_instruction,
+            }
+        else:
+            patched.insert(0, {"role": "system", "content": self._schema_instruction})
+
+        payload = {
+            "model": self._model,
+            "temperature": self._temperature,
+            "messages": patched,
+            "response_format": self._response_format,
+        }
+        resp = self._client.post(self.API_URL, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Track cost
+        usage = data.get("usage", {})
+        if self._cost_tracker and usage:
+            self._cost_tracker.record(
+                usage.get("prompt_tokens", 0),
+                usage.get("completion_tokens", 0),
+            )
+
+        # Parse structured output
+        content = data["choices"][0]["message"]["content"]
+        return self._schema.model_validate_json(content)
 
 
 # ── JSONL helpers ─────────────────────────────────────────────────────────────
@@ -418,11 +542,10 @@ def run_stage_agent_a(
     )
     params = AgentAParams(cache_enabled=True)
 
-    # Create LLM with cost tracking callback (shared across threads — runnables are thread-safe)
-    callbacks = [cost_tracker] if cost_tracker else []
-    structured_llm = init_chat_model(
-        "gpt-4o-mini", temperature=0, model_provider="openai", callbacks=callbacks,
-    ).with_structured_output(_LLMClassificationResponse)
+    # Httpx-based LLM (bypasses OpenAI SDK hang on Python 3.14)
+    structured_llm = HttpxStructuredLLM(
+        _LLMClassificationResponse, timeout=15.0, cost_tracker=cost_tracker,
+    )
 
     def _run_one(m: dict) -> tuple[str, dict | None]:
         mid = m["market_id"]
@@ -436,10 +559,12 @@ def run_stage_agent_a(
             end_date=m["end_date"],
         )
         try:
+            t0 = time.time()
             report = agent_a_initial(pkg, params, llm=structured_llm)
+            logger.info("Agent A [%s] done in %.1fs", mid[:12], time.time() - t0)
             return mid, report.model_dump()
         except Exception as e:
-            logger.warning("Agent A failed for %s: %s", mid, e)
+            logger.warning("Agent A failed for %s (%.1fs): %s", mid, time.time() - t0, e)
             return mid, None
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -490,14 +615,14 @@ def run_stage_agent_b(
     )
     b_params = AgentBParams()
 
-    # Create LLM with cost tracking callback
-    callbacks = [cost_tracker] if cost_tracker else []
-    structured_llm = init_chat_model(
-        "gpt-4o-mini", temperature=0, model_provider="openai", callbacks=callbacks,
-    ).with_structured_output(AgentBReport)
+    # Httpx-based LLM (bypasses OpenAI SDK hang on Python 3.14)
+    structured_llm = HttpxStructuredLLM(
+        _LLMAgentBResponse, timeout=30.0, cost_tracker=cost_tracker,
+    )
 
     def _run_one(m: dict) -> tuple[str, dict | None]:
         mid = m["market_id"]
+        t0 = time.time()
         try:
             volume_raw = m.get("volume", None)
             volume_total = float(volume_raw) if volume_raw not in (None, "", "nan") else None
@@ -511,9 +636,10 @@ def run_stage_agent_b(
                 market_age_days  = m["market_age_days"],
             )
             report = agent_b_initial(pkg, b_params, llm=structured_llm)
+            logger.info("Agent B [%s] done in %.1fs", mid[:12], time.time() - t0)
             return mid, report.model_dump()
         except Exception as e:
-            logger.warning("Agent B failed for %s: %s", mid, e)
+            logger.warning("Agent B failed for %s (%.1fs): %s", mid, time.time() - t0, e)
             return mid, None
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -535,14 +661,11 @@ def run_stage_revision(
     a_results: dict,
     b_results: dict,
     cache: dict,
-    max_workers: int = 20,
-    skip_llm: bool = False,
-    cost_tracker: CostTracker | None = None,
 ) -> dict:
     """
-    Run Revision Agent for markets where both A and B reports exist.
+    Run deterministic Revision Agent for markets where both A and B exist.
 
-    One revision call per market (no feedback loop — loop is a production feature).
+    No LLM — applies cross-pattern rules in Python (microseconds per market).
     Logs markets where feedback would have been sent to revision_loops.csv.
 
     Returns {market_id: revision_dict}.
@@ -557,13 +680,7 @@ def run_stage_revision(
     ]
 
     if not eligible:
-        logger.info("Revision: all eligible markets already cached")
-        return results
-
-    if skip_llm:
-        logger.info(
-            "Revision: --skip-llm set — skipping %d uncached markets", len(eligible)
-        )
+        logger.info("Revision: all %d markets already cached", len(results))
         return results
 
     logger.info(
@@ -571,43 +688,19 @@ def run_stage_revision(
         len(eligible), len(cache)
     )
 
-    # Create LLM with cost tracking callback
-    callbacks = [cost_tracker] if cost_tracker else []
-    structured_llm = init_chat_model(
-        "gpt-4o-mini", temperature=0, model_provider="openai", callbacks=callbacks,
-    ).with_structured_output(RevisionAgentOutput)
-
-    def _run_one(m: dict) -> tuple[str, dict | None]:
+    for m in tqdm(eligible, desc="Revision"):
         mid = m["market_id"]
-        try:
-            out = revision_agent(
-                agent_a_report=a_results[mid],
-                agent_b_report=b_results[mid],
-                llm=structured_llm,
-            )
-            d = out.model_dump()
-            # Drop redundant pass-through fields (stored separately in a/b jsonl)
-            d.pop("agent_a_report", None)
-            d.pop("agent_b_report", None)
-            return mid, d
-        except Exception as e:
-            logger.warning("Revision failed for %s: %s", mid, e)
-            return mid, None
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_run_one, m): m for m in eligible}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="Revision"):
-            m = futures[fut]
-            mid = m["market_id"]
-            rev_dict = fut.result()[1]
-            if rev_dict:
-                results[mid] = rev_dict
-                append_jsonl(REVISION_JSONL, mid, rev_dict, _rev_lock)
-                # Log to revision_loops.csv if feedback was sent
-                if rev_dict.get("feedback_to_send"):
-                    log_revision_loop(
-                        mid, str(m.get("question", "")), rev_dict
-                    )
+        out = revision_agent_deterministic(
+            agent_a_report=a_results[mid],
+            agent_b_report=b_results[mid],
+        )
+        d = out.model_dump()
+        d.pop("agent_a_report", None)
+        d.pop("agent_b_report", None)
+        results[mid] = d
+        append_jsonl(REVISION_JSONL, mid, d, _rev_lock)
+        if d.get("feedback_to_send"):
+            log_revision_loop(mid, str(m.get("question", "")), d)
 
     feedback_count = sum(
         1 for r in results.values() if r.get("feedback_to_send")
@@ -880,7 +973,7 @@ def print_funnel(
     print("SIGNAL FUNNEL")
     print("-" * 60)
     print(f"  Total markets in CSV:            {total_markets:>6}")
-    print(f"  With price data (≥5 points):     {markets_with_price:>6}")
+    print(f"  With price data (>=5 points):    {markets_with_price:>6}")
     print(f"  Agent A completed:               {a_count:>6}")
     print(f"  Agent B completed:               {b_count:>6}")
     print(f"  Revision completed:              {rev_count:>6}")
@@ -942,36 +1035,40 @@ def main() -> None:
     )
 
     # ── Stage 3+4: Agent A & B (concurrent) ────────────────────────────────────
+    # Each stage gets its own tracker to avoid cross-contamination during
+    # concurrent execution, then results are merged into the main tracker.
     logger.info("Stage 3+4: Agent A & B (running concurrently)")
-    tracker.snapshot("Agent A")
-    tracker.snapshot("Agent B")
+    a_tracker = CostTracker()
+    b_tracker = CostTracker()
 
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="stage") as stage_pool:
         fut_a = stage_pool.submit(
             run_stage_agent_a,
             markets, a_cache, max_workers=args.workers, skip_llm=skip_llm,
-            cost_tracker=tracker,
+            cost_tracker=a_tracker,
         )
         fut_b = stage_pool.submit(
             run_stage_agent_b,
             markets, b_cache, max_workers=args.workers, skip_llm=skip_llm,
-            cost_tracker=tracker,
+            cost_tracker=b_tracker,
         )
         a_results = fut_a.result()
         b_results = fut_b.result()
 
-    tracker.log_stage("Agent A")
-    tracker.log_stage("Agent B")
+    # Merge per-stage trackers into main tracker
+    for name, st in [("Agent A", a_tracker), ("Agent B", b_tracker)]:
+        tracker.merge_from(st, name)
+        logger.info(
+            "Cost [%s]: %d calls | %dk in + %dk out tokens | $%.4f stage | $%.4f cumulative",
+            name, st.calls, st.input_tokens // 1000, st.output_tokens // 1000,
+            st.cost, tracker.cost,
+        )
 
-    # ── Stage 5: Revision ─────────────────────────────────────────────────────
-    logger.info("Stage 5: Revision")
-    tracker.snapshot("Revision")
+    # ── Stage 5: Revision (deterministic — no LLM) ─────────────────────────────
+    logger.info("Stage 5: Revision (deterministic)")
     rev_results = run_stage_revision(
         markets, a_results, b_results, rev_cache,
-        max_workers=args.workers, skip_llm=skip_llm,
-        cost_tracker=tracker,
     )
-    tracker.log_stage("Revision")
 
     # ── Stage 6: Decisions ────────────────────────────────────────────────────
     logger.info("Stage 6: Running %d decision configs", len(DECISION_CONFIGS))

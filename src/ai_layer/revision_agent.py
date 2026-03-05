@@ -187,7 +187,108 @@ def _build_user_prompt(agent_a_report: dict, agent_b_report: dict) -> str:
     )
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Deterministic entry point (no LLM) ────────────────────────────────────────
+
+def revision_agent_deterministic(
+    agent_a_report: dict,
+    agent_b_report: dict,
+) -> RevisionAgentOutput:
+    """
+    Pure-Python revision agent — applies the same cross-pattern rules
+    that the LLM prompt describes, but without an LLM call.
+
+    Runs in microseconds. Preferred for backtesting.
+    """
+    a_score = agent_a_report.get("insider_risk_score", 0)
+    b_score = agent_b_report.get("behavior_score", 0)
+    b_dir   = agent_b_report.get("signal_direction", "SKIP")
+    b_sustained = agent_b_report.get(
+        "price_jump_assessment", {}
+    ).get("sustained", False)
+    b_contradictory = agent_b_report.get(
+        "consistency", {}
+    ).get("signals_contradictory", False)
+
+    flag = "NONE"
+    rec  = "GO_EVALUATE"
+    explanation = ""
+    feedback: list[FeedbackMessage] = []
+
+    # Pattern matching — ordered by priority (most specific first)
+    if a_score >= 7 and b_score >= 7 and b_dir != "SKIP":
+        flag = "DIRECTIONAL_CONFLICT"
+        rec  = "GO_EVALUATE"
+        explanation = (
+            f"Both agents signal high confidence (A={a_score}, B={b_score}) "
+            f"with B direction={b_dir}. Decision Agent resolves via weighting."
+        )
+    elif b_score >= 7 and b_contradictory:
+        flag = "INTERNAL_CONFLICT"
+        rec  = "GO_EVALUATE"
+        explanation = (
+            f"B scored {b_score} but signals_contradictory=true. "
+            f"Sending feedback to Agent B."
+        )
+        feedback.append(FeedbackMessage(
+            recipient="B",
+            message=(
+                f"Your behavior_score is {b_score} but signals_contradictory=true. "
+                f"Which signal (price jump vs momentum) do you consider more reliable?"
+            ),
+        ))
+    elif b_score >= 7 and not b_sustained:
+        flag = "REVERSION"
+        rec  = "GO_EVALUATE"
+        explanation = (
+            f"B scored {b_score} but is_sustained=false. "
+            f"Price jump may be noise. Sending feedback to Agent B."
+        )
+        feedback.append(FeedbackMessage(
+            recipient="B",
+            message=(
+                f"Your behavior_score is {b_score} but is_sustained=false. "
+                f"Does your score hold given the reversion?"
+            ),
+        ))
+    elif b_score >= 7 and a_score <= 3:
+        flag = "PUBLIC_INFO_ADJUSTED"
+        rec  = "SKIP"
+        explanation = (
+            f"B found anomaly (score={b_score}) but A sees low insider risk "
+            f"(score={a_score}). Market likely adjusted to public information."
+        )
+    elif a_score >= 7 and b_dir == "SKIP":
+        flag = "PRE_SIGNAL"
+        rec  = "WATCH"
+        explanation = (
+            f"A sees high insider risk (score={a_score}) but B found no market "
+            f"movement yet (direction=SKIP). Signal may be premature."
+        )
+    else:
+        flag = "NONE"
+        rec  = "GO_EVALUATE"
+        explanation = f"No cross-pattern detected (A={a_score}, B={b_score}, dir={b_dir})."
+
+    result = RevisionAgentOutput(
+        revision_flag=flag,
+        flag_explanation=explanation,
+        agent_a_report=agent_a_report,
+        agent_b_report=agent_b_report,
+        revision_notes=explanation,
+        feedback_to_send=feedback,
+        recommendation_to_decision_agent=rec,
+        iterations_used=0,
+    )
+
+    logger.debug(
+        "Revision Agent (deterministic): flag=%s recommendation=%s",
+        result.revision_flag,
+        result.recommendation_to_decision_agent,
+    )
+    return result
+
+
+# ── LLM entry point ──────────────────────────────────────────────────────────
 
 def revision_agent(
     agent_a_report: dict,
