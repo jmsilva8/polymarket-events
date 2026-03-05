@@ -6,16 +6,17 @@ Graph topology (multi-agent):
     START
       → load_markets
       → filter_markets
-      → run_agent_a          (insider risk scoring — text-based, sees market content)
-      → run_agent_b          (quantitative signals — blind, price/momentum only)
+      → run_agent_a ──┐      (insider risk scoring — text-based, sees market content)
+      → run_agent_b ──┤      (quantitative signals — blind, price/momentum only)
+                      ↓
       → run_revision         (cross-pattern QA + feedback loop, max 2 iterations)
       → run_decision         (final GO/SKIP with Bayesian weighting)
       → export_results
     END
 
 Design notes:
-  - Agent A and B are sequential nodes but fully independent (no shared state).
-    True parallel fan-out can be added via LangGraph Send() later.
+  - Agent A and B are parallel branches (fan-out from filter_markets, fan-in at
+    run_revision). They share no state so execution is safe to parallelize.
   - Revision node handles the feedback loop internally (loops back to Agent B
     at most MAX_REVISION_ITERATIONS times per market before passing forward).
   - All LLM calls use temperature=0 for backtesting reproducibility.
@@ -25,6 +26,7 @@ Design notes:
 
 import logging
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional, TypedDict
 
@@ -68,6 +70,7 @@ class MultiAgentState(TypedDict):
     export_path: str
     # When True: also runs LLM-based decision agent for comparison alongside deterministic
     compare_decision_methods: bool
+    max_workers: int                # parallel market concurrency (default: 20)
 
     # Intermediate — populated by load/filter nodes
     all_markets: list           # list[UnifiedMarket]
@@ -153,9 +156,10 @@ def run_agent_a(state: MultiAgentState) -> dict:
         model_name=state.get("primary_model", "gpt-4o-mini"),
         cache_enabled=True,
     )
+    max_workers = state.get("max_workers", 20)
     agent_a_reports: dict[str, dict] = {}
 
-    for market in state["filtered_markets"]:
+    def _process_one_a(market):
         try:
             package = AgentAInputPackage(
                 market_id=market.market_id,
@@ -167,10 +171,10 @@ def run_agent_a(state: MultiAgentState) -> dict:
                 end_date=market.end_date,
             )
             report: AgentAReport = agent_a_initial(package, params)
-            agent_a_reports[market.market_id] = report.model_dump()
+            return market.market_id, report.model_dump()
         except Exception as e:
             logger.error("Agent A failed for %s: %s", market.market_id, e)
-            agent_a_reports[market.market_id] = {
+            return market.market_id, {
                 "market_id": market.market_id,
                 "market_title": market.question,
                 "platform": market.platform.value,
@@ -181,6 +185,10 @@ def run_agent_a(state: MultiAgentState) -> dict:
                 "leak_vectors": [],
                 "model_used": "error-fallback",
             }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for mid, report in executor.map(_process_one_a, state["filtered_markets"]):
+            agent_a_reports[mid] = report
 
     logger.info("Agent A complete: %d markets", len(agent_a_reports))
     return {"agent_a_reports": agent_a_reports}
@@ -198,12 +206,12 @@ def run_agent_b(state: MultiAgentState) -> dict:
     Price history must be attached to UnifiedMarket objects for live data.
     """
     params = AgentBParams()
+    max_workers = state.get("max_workers", 20)
     agent_b_reports: dict[str, dict] = {}
     now = datetime.now(timezone.utc)
 
-    for market in state["filtered_markets"]:
+    def _process_one_b(market):
         try:
-            # Price history — absent for CSV-loaded markets
             price_history = []
             if hasattr(market, "price_history") and market.price_history:
                 ph = market.price_history
@@ -217,7 +225,6 @@ def run_agent_b(state: MultiAgentState) -> dict:
                 end_date=end_date,
                 price_history=price_history,
                 current_price=current_price,
-                # Volume: approximation fields if available, else None
                 volume_history=[],
                 volume_total_usd=market.volume if market.volume > 0 else None,
                 volume_24h_usd=market.volume_24h if market.volume_24h > 0 else None,
@@ -226,13 +233,11 @@ def run_agent_b(state: MultiAgentState) -> dict:
                     if market.start_date else None
                 ),
             )
-
             report: AgentBReport = agent_b_initial(package, params)
-            agent_b_reports[market.market_id] = report.model_dump()
-
+            return market.market_id, report.model_dump()
         except Exception as e:
             logger.error("Agent B failed for %s: %s", market.market_id, e)
-            agent_b_reports[market.market_id] = {
+            return market.market_id, {
                 "market_id": market.market_id,
                 "signal_direction": "SKIP",
                 "behavior_score": 1,
@@ -244,6 +249,10 @@ def run_agent_b(state: MultiAgentState) -> dict:
                 "tools_skipped": ["price_jump_detector", "momentum_analyzer", "volume_spike_checker"],
                 "data_quality_notes": [],
             }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for mid, report in executor.map(_process_one_b, state["filtered_markets"]):
+            agent_b_reports[mid] = report
 
     logger.info("Agent B complete: %d markets", len(agent_b_reports))
     return {"agent_b_reports": agent_b_reports}
@@ -268,10 +277,10 @@ def run_revision(state: MultiAgentState) -> dict:
         cache_enabled=False,  # Don't cache revision outputs — they differ from initial
     )
     agent_b_params = AgentBParams()
+    max_workers = state.get("max_workers", 20)
     now = datetime.now(timezone.utc)
-    revision_outputs: dict[str, dict] = {}
 
-    for market in state["filtered_markets"]:
+    def _process_one_revision(market):
         mid = market.market_id
         a_report = state["agent_a_reports"].get(mid, {})
         b_report = state["agent_b_reports"].get(mid, {})
@@ -279,6 +288,8 @@ def run_revision(state: MultiAgentState) -> dict:
         iterations = 0
         current_a_report = a_report
         current_b_report = b_report
+        a_changed = False
+        b_changed = False
 
         while iterations < MAX_REVISION_ITERATIONS:
             rev_out: RevisionAgentOutput = revision_agent(
@@ -320,6 +331,7 @@ def run_revision(state: MultiAgentState) -> dict:
                         "info_holders": a_revision.updated_info_holders,
                         "leak_vectors": a_revision.updated_leak_vectors,
                     }
+                    a_changed = a_changed or a_revision.finding_changed
                     logger.debug(
                         "Revision loop %d/%d for %s (A): finding_changed=%s new_score=%d",
                         iterations, MAX_REVISION_ITERATIONS, mid,
@@ -366,6 +378,7 @@ def run_revision(state: MultiAgentState) -> dict:
                         "reasoning": b_revision.final_reasoning,
                         "context_for_other_agents": b_revision.context_for_other_agents,
                     }
+                    b_changed = b_changed or b_revision.finding_changed
                     logger.debug(
                         "Revision loop %d/%d for %s (B): finding_changed=%s new_score=%d",
                         iterations, MAX_REVISION_ITERATIONS, mid,
@@ -378,9 +391,38 @@ def run_revision(state: MultiAgentState) -> dict:
 
         rev_out.agent_a_report = current_a_report
         rev_out.agent_b_report = current_b_report
-        revision_outputs[mid] = rev_out.model_dump()
 
-    logger.info("Revision node complete: %d markets", len(revision_outputs))
+        logger.info(
+            "[revision] market_id=%s  flag=%s  a_changed=%s  b_changed=%s  iters=%d",
+            mid, rev_out.revision_flag, a_changed, b_changed, rev_out.iterations_used,
+        )
+        return mid, rev_out.model_dump(), {
+            "flag": rev_out.revision_flag,
+            "a_changed": a_changed,
+            "b_changed": b_changed,
+            "iters": rev_out.iterations_used,
+        }
+
+    revision_outputs: dict[str, dict] = {}
+    revision_stats: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for mid, output, stat in executor.map(_process_one_revision, state["filtered_markets"]):
+            revision_outputs[mid] = output
+            revision_stats.append(stat)
+
+    # Aggregate summary
+    flag_counts = Counter(s["flag"] for s in revision_stats)
+    n = len(revision_stats)
+    avg_iters = sum(s["iters"] for s in revision_stats) / n if n else 0
+    logger.info(
+        "[revision] summary: %d markets | flags: %s | a_changed=%d  b_changed=%d  avg_iters=%.1f",
+        n,
+        "  ".join(f"{k}={v}" for k, v in flag_counts.most_common()),
+        sum(s["a_changed"] for s in revision_stats),
+        sum(s["b_changed"] for s in revision_stats),
+        avg_iters,
+    )
     return {"revision_outputs": revision_outputs}
 
 
@@ -396,25 +438,26 @@ def run_decision(state: MultiAgentState) -> dict:
     det_params = DecisionAgentParams(
         model_name=state.get("decision_model", "gpt-4o-mini")
     )
+    max_workers = state.get("max_workers", 20)
     now = datetime.now(timezone.utc)
     compare = state.get("compare_decision_methods", False)
 
-    decision_outputs: dict[str, dict] = {}
-    decision_outputs_llm: dict[str, dict] = {}
+    def _error_fallback(mid, rev, e):
+        return {
+            "market_id": mid,
+            "decision": "SKIP",
+            "bet_direction": "null",
+            "full_reasoning": f"Decision Agent error: {e}",
+            "revision_flag_applied": rev.get("revision_flag", "NONE"),
+            "recommendation": {"action": "PASS"},
+            "evaluation_date": now.isoformat(),
+        }
 
-    _error_fallback = lambda mid, rev, e: {
-        "market_id": mid,
-        "decision": "SKIP",
-        "bet_direction": "null",
-        "full_reasoning": f"Decision Agent error: {e}",
-        "revision_flag_applied": rev.get("revision_flag", "NONE"),
-        "recommendation": {"action": "PASS"},
-        "evaluation_date": now.isoformat(),
-    }
-
-    for market in state["filtered_markets"]:
+    def _process_one_decision(market):
         mid = market.market_id
         rev = state["revision_outputs"].get(mid, {})
+        det_result = None
+        llm_result = None
 
         try:
             package = DecisionAgentInputPackage(
@@ -432,22 +475,31 @@ def run_decision(state: MultiAgentState) -> dict:
                 market_id=mid,
             )
 
-            # Primary: deterministic (always runs)
-            det_output = decision_agent_deterministic(package, det_params)
-            decision_outputs[mid] = det_output.model_dump()
+            det_result = decision_agent_deterministic(package, det_params).model_dump()
 
-            # Comparison: LLM-based (optional)
             if compare:
                 try:
-                    llm_output = decision_agent(package, det_params)
-                    decision_outputs_llm[mid] = llm_output.model_dump()
+                    llm_result = decision_agent(package, det_params).model_dump()
                 except Exception as e:
                     logger.error("LLM Decision Agent failed for %s: %s", mid, e)
-                    decision_outputs_llm[mid] = _error_fallback(mid, rev, e)
+                    llm_result = _error_fallback(mid, rev, e)
 
         except Exception as e:
             logger.error("Decision Agent failed for %s: %s", mid, e)
-            decision_outputs[mid] = _error_fallback(mid, rev, e)
+            det_result = _error_fallback(mid, rev, e)
+
+        return mid, det_result, llm_result
+
+    decision_outputs: dict[str, dict] = {}
+    decision_outputs_llm: dict[str, dict] = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for mid, det_result, llm_result in executor.map(
+            _process_one_decision, state["filtered_markets"]
+        ):
+            decision_outputs[mid] = det_result
+            if llm_result is not None:
+                decision_outputs_llm[mid] = llm_result
 
     logger.info(
         "Decision node complete: %d markets (LLM comparison: %s)",
@@ -582,9 +634,10 @@ def build_multi_agent_graph():
 
     builder.add_edge(START, "load_markets")
     builder.add_edge("load_markets", "filter_markets")
+    # A and B are fully independent — run in parallel, fan-in at run_revision
     builder.add_edge("filter_markets", "run_agent_a")
-    # A and B are independent — B runs after A but reads no A output
-    builder.add_edge("run_agent_a", "run_agent_b")
+    builder.add_edge("filter_markets", "run_agent_b")
+    builder.add_edge("run_agent_a", "run_revision")
     builder.add_edge("run_agent_b", "run_revision")
     builder.add_edge("run_revision", "run_decision")
     builder.add_edge("run_decision", "export_results")
