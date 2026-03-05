@@ -19,6 +19,13 @@ class DecisionAgentParams:
     weight_a: float = 0.4
     weight_b: float = 0.6
 
+    # Confidence multipliers — scale each agent's score before combining.
+    # Low confidence deflates the effective score, reducing its influence.
+    # Tune these via backtesting; defaults reflect moderate penalty for uncertainty.
+    confidence_high: float = 1.0
+    confidence_medium: float = 0.85
+    confidence_low: float = 0.70
+
     # Minimum weighted_score (1-10 scale) required to GO
     go_score_threshold: float = 6.5
 

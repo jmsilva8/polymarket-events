@@ -299,12 +299,14 @@ def decision_agent_deterministic(
             f"Revision Agent: WATCH. {package.flag_explanation}", action="WATCH"
         )
 
-    # 3. Extract scores
+    # 3. Extract scores and confidence
     a_score = package.agent_a_report.get("insider_risk_score", 1)
     b_score = package.agent_b_report.get("behavior_score", 1)
+    a_confidence = package.agent_a_report.get("confidence", "medium")
+    b_confidence = package.agent_b_report.get("confidence", "medium")
     signal_direction = package.agent_b_report.get("signal_direction", "SKIP")
 
-    # 4. Score gates
+    # 4. Score gates (applied to raw scores before confidence adjustment)
     if a_score < params.min_a_score:
         return _skip(
             f"Agent A score {a_score} below minimum {params.min_a_score}. SKIP."
@@ -318,10 +320,19 @@ def decision_agent_deterministic(
     if signal_direction == "SKIP":
         return _skip("Agent B has no directional signal. SKIP.")
 
-    # 6. Weighted score
-    weighted_score = round(params.weight_a * a_score + params.weight_b * b_score, 2)
+    # 6. Apply confidence multipliers to effective scores
+    _conf_mult = {
+        "high": params.confidence_high,
+        "medium": params.confidence_medium,
+        "low": params.confidence_low,
+    }
+    eff_a = a_score * _conf_mult.get(a_confidence, params.confidence_medium)
+    eff_b = b_score * _conf_mult.get(b_confidence, params.confidence_medium)
 
-    # 7. Score threshold
+    # 7. Weighted score
+    weighted_score = round(params.weight_a * eff_a + params.weight_b * eff_b, 2)
+
+    # 8. Score threshold
     if weighted_score < params.go_score_threshold:
         return _skip(
             f"Weighted score {weighted_score:.2f} below threshold "
@@ -343,8 +354,9 @@ def decision_agent_deterministic(
 
     # 10. GO
     reasoning = (
-        f"GO: A={a_score} B={b_score} → weighted={weighted_score:.2f} "
-        f"(threshold={params.go_score_threshold}). "
+        f"GO: A={a_score}({a_confidence})→eff={eff_a:.2f} "
+        f"B={b_score}({b_confidence})→eff={eff_b:.2f} "
+        f"weighted={weighted_score:.2f} (threshold={params.go_score_threshold}). "
         f"Signal={signal_direction}. Edge≈{edge_pp:.1f}pp "
         f"(price={package.current_market_price:.2f} → adj={adjusted_prob:.2f})."
     )
@@ -356,7 +368,11 @@ def decision_agent_deterministic(
             "agent_b_score": b_score,
             "weight_a_percentage": int(params.weight_a * 100),
             "weight_b_percentage": int(params.weight_b * 100),
-            "weighting_rationale": f"Fixed weights: A={params.weight_a:.0%} B={params.weight_b:.0%}",
+            "weighting_rationale": (
+                f"Fixed weights A={params.weight_a:.0%} B={params.weight_b:.0%} "
+                f"× confidence multipliers (A:{a_confidence}={_conf_mult.get(a_confidence):.2f}, "
+                f"B:{b_confidence}={_conf_mult.get(b_confidence):.2f})"
+            ),
             "weighted_score": weighted_score,
             "current_market_price": package.current_market_price,
             "adjusted_probability_of_win": adjusted_prob,
