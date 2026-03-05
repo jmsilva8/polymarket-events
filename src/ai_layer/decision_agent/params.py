@@ -23,11 +23,11 @@ class DecisionAgentParams:
     # Low confidence deflates the effective score, reducing its influence.
     # Tune these via backtesting; defaults reflect moderate penalty for uncertainty.
     confidence_high: float = 1.0
-    confidence_medium: float = 0.85
-    confidence_low: float = 0.70
+    confidence_medium: float = 0.90
+    confidence_low: float = 0.75
 
     # Minimum weighted_score (1-10 scale) required to GO
-    go_score_threshold: float = 6.5
+    go_score_threshold: float = 6.0
 
     # Maximum estimated edge in percentage points (pp) at weighted_score = 10
     # Used in the linear edge estimation formula
