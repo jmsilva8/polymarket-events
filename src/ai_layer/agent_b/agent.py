@@ -174,9 +174,6 @@ def agent_b_initial(
     7. Single LLM call → AgentBReport (structured output)
     8. Populate audit fields
     """
-    import time as _time
-    _t0 = _time.time()
-
     if llm is None:
         llm = _make_llm()
 
@@ -184,8 +181,6 @@ def agent_b_initial(
     assessment = assess_inputs(package, params)
     tools_run: list[str] = []
     tools_skipped: list[str] = list(assessment.skipped_tools)
-    logger.info("Agent B step 1 (assess) %.1fs | pts=%d", _time.time() - _t0, assessment.price_point_count)
-
     # 2. Price jump detector
     price_result: Optional[PriceJumpResult] = None
     if assessment.can_run_price_jump:
@@ -200,8 +195,6 @@ def agent_b_initial(
         except Exception as e:
             logger.warning("price_jump_detector failed: %s", e)
             tools_skipped.append("price_jump_detector")
-    logger.info("Agent B step 2 (price_jump) %.1fs", _time.time() - _t0)
-
     # 3. Volume spike checker
     volume_result: Optional[VolumeResult] = None
     if assessment.can_run_volume:
@@ -213,8 +206,6 @@ def agent_b_initial(
         except Exception as e:
             logger.warning("volume_spike_checker failed: %s", e)
             tools_skipped.append("volume_spike_checker")
-    logger.info("Agent B step 3 (volume) %.1fs", _time.time() - _t0)
-
     # 4. Momentum analyzer
     momentum_result: Optional[MomentumResult] = None
     if assessment.can_run_momentum:
@@ -229,8 +220,6 @@ def agent_b_initial(
         except Exception as e:
             logger.warning("momentum_analyzer failed: %s", e)
             tools_skipped.append("momentum_analyzer")
-    logger.info("Agent B step 4 (momentum) %.1fs", _time.time() - _t0)
-
     # 5. Consistency check (only if at least one tool ran)
     consistency: Optional[ConsistencyCheck] = None
     if price_result is not None or momentum_result is not None:
@@ -264,13 +253,11 @@ def agent_b_initial(
         assessment, price_result, volume_result, momentum_result, consistency, package
     )
 
-    logger.info("Agent B step 6 (prompt built) %.1fs | prompt_len=%d", _time.time() - _t0, len(user_prompt))
     try:
         llm_out: _LLMAgentBResponse = llm.invoke([
             {"role": "system", "content": AGENT_B_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ])
-        logger.info("Agent B step 7 (LLM done) %.1fs", _time.time() - _t0)
     except Exception as e:
         logger.error("Agent B LLM call failed: %s", e)
         return AgentBReport(

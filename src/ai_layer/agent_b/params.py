@@ -11,17 +11,18 @@ class AgentBParams:
     Same pattern as StrategyParams in src/backtest_engine/strategy.py.
 
     Backtesting note: historical data arrives at 12h resolution
-    (6 points: t-72h, t-60h, t-48h, t-36h, t-24h, t-12h before close).
-    min_price_points is set to 5 to allow tools to run with this data.
+    over a 5-day window (120h before close to 24h before close = 96h).
+    At 12h resolution that yields ~8 data points.
+    min_price_points is set to 3 to avoid filtering markets with sparse data.
     Sub-12h windows are excluded since no data exists at that resolution.
     """
     # Input assessment
-    min_price_points: int = 5
+    min_price_points: int = 3
     # If set, appended to data_quality_notes so LLM knows data resolution
     data_frequency_hours: int = 12
 
-    # price_jump_detector — 6h window dropped (no data at that resolution)
-    jump_windows_hours: list[int] = field(default_factory=lambda: [12, 24, 36, 48, 60, 72])
+    # price_jump_detector — covers the full 96h data window
+    jump_windows_hours: list[int] = field(default_factory=lambda: [12, 24, 36, 48, 60, 72, 84, 96])
     min_jump_pp: float = 5.0
     sustained_revert_threshold: float = 0.5
 

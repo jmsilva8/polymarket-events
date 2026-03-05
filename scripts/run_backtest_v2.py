@@ -3,7 +3,7 @@ Backtesting pipeline v2 — full A → B → Revision → Decision chain.
 
 Stages:
   1. Load markets from parquet
-  2. Filter to markets with sufficient price data in SQLite [end_date-72h, end_date-24h]
+  2. Filter to markets with sufficient price data in SQLite [end_date-120h, end_date-24h]
   3. Run Agent A (LLM, cached in data/backtest/agent_a.jsonl)
   4. Run Agent B (LLM, cached in data/backtest/agent_b.jsonl)
   5. Run Revision (LLM, cached in data/backtest/revision.jsonl)
@@ -268,8 +268,25 @@ class HttpxStructuredLLM:
             "messages": patched,
             "response_format": self._response_format,
         }
-        resp = self._client.post(self.API_URL, json=payload)
-        resp.raise_for_status()
+        # Retry with exponential backoff for rate limits (429) and server errors (5xx)
+        last_exc = None
+        for attempt in range(5):
+            try:
+                resp = self._client.post(self.API_URL, json=payload)
+                if resp.status_code in (429, 500, 502, 503):
+                    wait = min(2 ** attempt * 1.0, 30.0)
+                    logger.debug("OpenAI %d — retry %d in %.1fs", resp.status_code, attempt + 1, wait)
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                break
+            except httpx.TimeoutException as e:
+                last_exc = e
+                wait = min(2 ** attempt * 1.0, 30.0)
+                logger.debug("Timeout — retry %d in %.1fs", attempt + 1, wait)
+                time.sleep(wait)
+        else:
+            raise last_exc or RuntimeError("OpenAI API failed after 5 retries")
         data = resp.json()
 
         # Track cost
@@ -544,7 +561,7 @@ def run_stage_agent_a(
 
     # Httpx-based LLM (bypasses OpenAI SDK hang on Python 3.14)
     structured_llm = HttpxStructuredLLM(
-        _LLMClassificationResponse, timeout=15.0, cost_tracker=cost_tracker,
+        _LLMClassificationResponse, timeout=30.0, cost_tracker=cost_tracker,
     )
 
     def _run_one(m: dict) -> tuple[str, dict | None]:
@@ -591,7 +608,7 @@ def run_stage_agent_b(
     """
     Run Agent B for all markets.
 
-    Price history is pre-filtered to [end_date−72h, end_date−24h].
+    Price history is pre-filtered to [end_date-120h, end_date-24h].
     evaluation_date = end_date − 24h (decision made at 24 h before close).
     volume_total_usd = final volume from CSV (used as proxy signal).
 
@@ -973,7 +990,7 @@ def print_funnel(
     print("SIGNAL FUNNEL")
     print("-" * 60)
     print(f"  Total markets in CSV:            {total_markets:>6}")
-    print(f"  With price data (>=5 points):    {markets_with_price:>6}")
+    print(f"  With price data (>=3 points):    {markets_with_price:>6}")
     print(f"  Agent A completed:               {a_count:>6}")
     print(f"  Agent B completed:               {b_count:>6}")
     print(f"  Revision completed:              {rev_count:>6}")
