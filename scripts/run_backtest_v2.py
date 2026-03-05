@@ -232,14 +232,17 @@ def _get_price_at(
     return float(row[0]) if row else None
 
 
-def prepare_markets(markets: list[dict]) -> list[dict]:
+def prepare_markets(markets: list[dict], db_path: Path = DB_PATH) -> list[dict]:
     """
     For each market, load price history from SQLite filtered to
     [end_date − 72h, end_date − 24h] and attach to the dict.
 
     Markets with < 5 price points in that window are skipped.
     """
-    conn = sqlite3.connect(str(DB_PATH))
+    if not db_path.exists():
+        logger.error("SQLite DB not found: %s", db_path)
+        return []
+    conn = sqlite3.connect(str(db_path))
     skipped = {"no_end_date": 0, "no_price_data": 0, "insufficient_points": 0}
     ready: list[dict] = []
 
@@ -671,8 +674,15 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     wins   = (pnl_known > 0).sum()
     losses = (pnl_known <= 0).sum()
 
-    total_pnl    = pnl_known.sum()
-    total_stakes = go_df.loc[pnl_known.index, "entry_price"].sum()
+    total_pnl = pnl_known.sum()
+
+    # Stake per trade: YES bet costs entry_price, NO bet costs (1 - entry_price)
+    go_known = go_df.loc[pnl_known.index]
+    effective_stakes = go_known.apply(
+        lambda r: r["entry_price"] if r["bet_direction"] == "YES" else (1.0 - r["entry_price"]),
+        axis=1,
+    )
+    total_stakes = effective_stakes.sum()
     roi_pct      = (total_pnl / total_stakes * 100) if total_stakes > 0 else None
 
     sharpe = None
@@ -811,7 +821,7 @@ def main() -> None:
 
     # ── Stage 2: Filter to markets with price data ────────────────────────────
     logger.info("Stage 2: Filtering markets with price data")
-    markets = prepare_markets(all_markets)
+    markets = prepare_markets(all_markets, db_path=args.db)
 
     if not markets:
         logger.error("No markets with price data found. Check %s exists.", args.db)
