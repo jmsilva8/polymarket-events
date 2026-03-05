@@ -30,8 +30,10 @@ POLYMARKET_GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
 POLYMARKET_CLOB_BASE_URL = "https://clob.polymarket.com"
 
 # Rate limits: Polymarket ~1000 req/hr, Kalshi 20 req/sec (basic tier)
-POLYMARKET_RATE = 0.25  # requests per second (conservative)
+POLYMARKET_RATE = 0.25  # requests per second (conservative, for Gamma API)
 POLYMARKET_BURST = 5
+POLYMARKET_CLOB_RATE = 1.5  # requests per second for CLOB price history
+POLYMARKET_CLOB_BURST = 2
 KALSHI_RATE = 10.0  # requests per second (conservative vs 20 limit)
 KALSHI_BURST = 10
 

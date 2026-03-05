@@ -184,7 +184,8 @@ class PolymarketClient(BaseMarketClient):
             )
 
             if page_path and page_path.exists():
-                raw_page = json.loads(page_path.read_text())
+                with open(page_path, "r", encoding="utf-8") as f:
+                    raw_page = json.load(f)
                 events = [self._parse_event(e) for e in raw_page]
                 logger.debug("Page %d: loaded %d events from cache", page, len(events))
             else:
@@ -192,7 +193,8 @@ class PolymarketClient(BaseMarketClient):
                 if page_path and events:
                     raw_page = [e.raw_data for e in events if e.raw_data]
                     page_path.parent.mkdir(parents=True, exist_ok=True)
-                    page_path.write_text(json.dumps(raw_page))
+                    with open(page_path, "w", encoding="utf-8") as f:
+                        json.dump(raw_page, f)
 
             all_events.extend(events)
             if len(events) < page_size:
