@@ -16,7 +16,7 @@ import logging
 from typing import Literal, Optional
 
 from langchain.chat_models import init_chat_model
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +52,9 @@ class RevisionAgentOutput(BaseModel):
     ]
     flag_explanation: str
 
-    # Pass-through for Decision Agent context
-    agent_a_report: dict
-    agent_b_report: dict
+    # Pass-through for Decision Agent context — set after LLM call, excluded from schema
+    agent_a_report: dict = Field(default_factory=dict, exclude=True)
+    agent_b_report: dict = Field(default_factory=dict, exclude=True)
 
     # Narrative combining coherence assessment + pattern evidence + feedback decisions
     revision_notes: str
