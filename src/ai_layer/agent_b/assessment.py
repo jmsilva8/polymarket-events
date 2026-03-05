@@ -29,20 +29,27 @@ def assess_inputs(
             f"Jump detection is the primary signal — momentum regression has limited reliability."
         )
 
-    if package.volume_history and len(package.volume_history) >= 7:
-        volume_mode = "timeseries"
-    elif (
+    has_history = bool(package.volume_history) and len(package.volume_history) >= 7
+    can_approx = (
         package.volume_24h_usd is not None
         and package.volume_total_usd is not None
         and package.market_age_days is not None
-    ):
+    )
+
+    if has_history:
+        volume_mode = "timeseries"
+        volume_source: str | None = "timeseries"
+    elif can_approx:
         volume_mode = "approximation"
+        volume_source = "proxy_total"
         notes.append(
-            "Volume: approximation mode (no per-period breakdown). "
-            "Volume signal carries lower confidence."
+            "Volume: proxy_total fallback (total_usd / market_age_days). "
+            "In backtesting this reflects end-of-market totals, not volume at eval time. "
+            "Treat volume signal as directional context only — lower confidence."
         )
     else:
         volume_mode = "unavailable"
+        volume_source = None
         skipped.append("volume_spike_checker")
         notes.append("Volume data unavailable. Volume signal omitted.")
 
@@ -55,6 +62,7 @@ def assess_inputs(
         can_run_momentum=price_ok,
         can_run_volume=volume_mode != "unavailable",
         volume_mode=volume_mode,
+        volume_source=volume_source,
         price_point_count=len(package.price_history),
         hours_to_close=hours_to_close,
         skipped_tools=skipped,

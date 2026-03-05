@@ -198,6 +198,7 @@ def volume_spike_checker(
         if not baseline_points:
             return VolumeResult(
                 mode="timeseries",
+                volume_source="timeseries",
                 spike_detected=False,
                 spike_ratio=None,
                 baseline_avg=None,
@@ -240,6 +241,7 @@ def volume_spike_checker(
 
         return VolumeResult(
             mode="timeseries",
+            volume_source="timeseries",
             spike_detected=spike_detected,
             spike_ratio=round(spike_ratio, 2) if spike_ratio is not None else None,
             baseline_avg=round(baseline_avg, 2),
@@ -258,6 +260,7 @@ def volume_spike_checker(
         ):
             return VolumeResult(
                 mode="approximation",
+                volume_source="proxy_total",
                 spike_detected=False,
                 spike_ratio=None,
                 baseline_avg=None,
@@ -277,6 +280,7 @@ def volume_spike_checker(
 
         return VolumeResult(
             mode="approximation",
+            volume_source="proxy_total",
             spike_detected=spike_detected,
             spike_ratio=round(spike_ratio, 2) if spike_ratio is not None else None,
             baseline_avg=round(baseline_avg, 2),
@@ -284,7 +288,8 @@ def volume_spike_checker(
             hours_before_close=hours_to_close,
             pattern=None,  # cannot determine from single snapshot
             note=(
-                "Approximation mode: baseline = total_volume / market_age_days. "
+                "FALLBACK proxy_total: baseline = total_volume / market_age_days. "
+                "In backtesting this reflects end-of-market totals, not volume at eval time. "
                 "Pattern unavailable (single snapshot). Lower confidence."
             ),
         )

@@ -42,6 +42,7 @@ class InputAssessment(BaseModel):
     can_run_momentum: bool
     can_run_volume: bool
     volume_mode: Literal["timeseries", "approximation", "unavailable"]
+    volume_source: Optional[Literal["timeseries", "proxy_total"]] = None
     price_point_count: int
     hours_to_close: float
     skipped_tools: list[str]
@@ -67,6 +68,7 @@ class PriceJumpResult(BaseModel):
 
 class VolumeResult(BaseModel):
     mode: Literal["timeseries", "approximation", "unavailable"]
+    volume_source: Optional[Literal["timeseries", "proxy_total"]] = None
     spike_detected: bool
     spike_ratio: Optional[float]
     baseline_avg: Optional[float]

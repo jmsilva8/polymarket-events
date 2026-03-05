@@ -31,6 +31,12 @@ Only reduce confidence (to "medium" or "low") when working price-only.
 A strong price/momentum signal without volume confirmation is still a valid signal —
 volume absence is a data gap, not evidence of no signal.
 
+When volume_source="timeseries": baseline is real per-period data — treat as high confidence.
+When volume_source="proxy_total": baseline = total_volume / market_age_days, which in
+backtesting reflects end-of-market totals rather than volume at eval time. Treat the
+volume signal as directional context only — do not treat spike_ratio as a precise measure,
+and weight it lower than timeseries evidence.
+
 YOUR TASK:
 1. Assess the magnitude and quality of each signal independently
 2. Evaluate whether signals are consistent with each other
