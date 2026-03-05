@@ -26,6 +26,7 @@ Design notes:
 
 import logging
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Optional, TypedDict
 
@@ -69,6 +70,7 @@ class MultiAgentState(TypedDict):
     export_path: str
     # When True: also runs LLM-based decision agent for comparison alongside deterministic
     compare_decision_methods: bool
+    max_workers: int                # parallel market concurrency (default: 20)
 
     # Intermediate — populated by load/filter nodes
     all_markets: list           # list[UnifiedMarket]
@@ -154,9 +156,10 @@ def run_agent_a(state: MultiAgentState) -> dict:
         model_name=state.get("primary_model", "gpt-4o-mini"),
         cache_enabled=True,
     )
+    max_workers = state.get("max_workers", 20)
     agent_a_reports: dict[str, dict] = {}
 
-    for market in state["filtered_markets"]:
+    def _process_one_a(market):
         try:
             package = AgentAInputPackage(
                 market_id=market.market_id,
@@ -168,10 +171,10 @@ def run_agent_a(state: MultiAgentState) -> dict:
                 end_date=market.end_date,
             )
             report: AgentAReport = agent_a_initial(package, params)
-            agent_a_reports[market.market_id] = report.model_dump()
+            return market.market_id, report.model_dump()
         except Exception as e:
             logger.error("Agent A failed for %s: %s", market.market_id, e)
-            agent_a_reports[market.market_id] = {
+            return market.market_id, {
                 "market_id": market.market_id,
                 "market_title": market.question,
                 "platform": market.platform.value,
@@ -182,6 +185,10 @@ def run_agent_a(state: MultiAgentState) -> dict:
                 "leak_vectors": [],
                 "model_used": "error-fallback",
             }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for mid, report in executor.map(_process_one_a, state["filtered_markets"]):
+            agent_a_reports[mid] = report
 
     logger.info("Agent A complete: %d markets", len(agent_a_reports))
     return {"agent_a_reports": agent_a_reports}
@@ -199,12 +206,12 @@ def run_agent_b(state: MultiAgentState) -> dict:
     Price history must be attached to UnifiedMarket objects for live data.
     """
     params = AgentBParams()
+    max_workers = state.get("max_workers", 20)
     agent_b_reports: dict[str, dict] = {}
     now = datetime.now(timezone.utc)
 
-    for market in state["filtered_markets"]:
+    def _process_one_b(market):
         try:
-            # Price history — absent for CSV-loaded markets
             price_history = []
             if hasattr(market, "price_history") and market.price_history:
                 ph = market.price_history
@@ -218,7 +225,6 @@ def run_agent_b(state: MultiAgentState) -> dict:
                 end_date=end_date,
                 price_history=price_history,
                 current_price=current_price,
-                # Volume: approximation fields if available, else None
                 volume_history=[],
                 volume_total_usd=market.volume if market.volume > 0 else None,
                 volume_24h_usd=market.volume_24h if market.volume_24h > 0 else None,
@@ -227,13 +233,11 @@ def run_agent_b(state: MultiAgentState) -> dict:
                     if market.start_date else None
                 ),
             )
-
             report: AgentBReport = agent_b_initial(package, params)
-            agent_b_reports[market.market_id] = report.model_dump()
-
+            return market.market_id, report.model_dump()
         except Exception as e:
             logger.error("Agent B failed for %s: %s", market.market_id, e)
-            agent_b_reports[market.market_id] = {
+            return market.market_id, {
                 "market_id": market.market_id,
                 "signal_direction": "SKIP",
                 "behavior_score": 1,
@@ -245,6 +249,10 @@ def run_agent_b(state: MultiAgentState) -> dict:
                 "tools_skipped": ["price_jump_detector", "momentum_analyzer", "volume_spike_checker"],
                 "data_quality_notes": [],
             }
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for mid, report in executor.map(_process_one_b, state["filtered_markets"]):
+            agent_b_reports[mid] = report
 
     logger.info("Agent B complete: %d markets", len(agent_b_reports))
     return {"agent_b_reports": agent_b_reports}
@@ -269,11 +277,10 @@ def run_revision(state: MultiAgentState) -> dict:
         cache_enabled=False,  # Don't cache revision outputs — they differ from initial
     )
     agent_b_params = AgentBParams()
+    max_workers = state.get("max_workers", 20)
     now = datetime.now(timezone.utc)
-    revision_outputs: dict[str, dict] = {}
-    revision_stats: list[dict] = []
 
-    for market in state["filtered_markets"]:
+    def _process_one_revision(market):
         mid = market.market_id
         a_report = state["agent_a_reports"].get(mid, {})
         b_report = state["agent_b_reports"].get(mid, {})
@@ -384,18 +391,25 @@ def run_revision(state: MultiAgentState) -> dict:
 
         rev_out.agent_a_report = current_a_report
         rev_out.agent_b_report = current_b_report
-        revision_outputs[mid] = rev_out.model_dump()
 
         logger.info(
             "[revision] market_id=%s  flag=%s  a_changed=%s  b_changed=%s  iters=%d",
             mid, rev_out.revision_flag, a_changed, b_changed, rev_out.iterations_used,
         )
-        revision_stats.append({
+        return mid, rev_out.model_dump(), {
             "flag": rev_out.revision_flag,
             "a_changed": a_changed,
             "b_changed": b_changed,
             "iters": rev_out.iterations_used,
-        })
+        }
+
+    revision_outputs: dict[str, dict] = {}
+    revision_stats: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for mid, output, stat in executor.map(_process_one_revision, state["filtered_markets"]):
+            revision_outputs[mid] = output
+            revision_stats.append(stat)
 
     # Aggregate summary
     flag_counts = Counter(s["flag"] for s in revision_stats)
