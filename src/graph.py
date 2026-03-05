@@ -6,16 +6,17 @@ Graph topology (multi-agent):
     START
       → load_markets
       → filter_markets
-      → run_agent_a          (insider risk scoring — text-based, sees market content)
-      → run_agent_b          (quantitative signals — blind, price/momentum only)
+      → run_agent_a ──┐      (insider risk scoring — text-based, sees market content)
+      → run_agent_b ──┤      (quantitative signals — blind, price/momentum only)
+                      ↓
       → run_revision         (cross-pattern QA + feedback loop, max 2 iterations)
       → run_decision         (final GO/SKIP with Bayesian weighting)
       → export_results
     END
 
 Design notes:
-  - Agent A and B are sequential nodes but fully independent (no shared state).
-    True parallel fan-out can be added via LangGraph Send() later.
+  - Agent A and B are parallel branches (fan-out from filter_markets, fan-in at
+    run_revision). They share no state so execution is safe to parallelize.
   - Revision node handles the feedback loop internally (loops back to Agent B
     at most MAX_REVISION_ITERATIONS times per market before passing forward).
   - All LLM calls use temperature=0 for backtesting reproducibility.
@@ -270,6 +271,7 @@ def run_revision(state: MultiAgentState) -> dict:
     agent_b_params = AgentBParams()
     now = datetime.now(timezone.utc)
     revision_outputs: dict[str, dict] = {}
+    revision_stats: list[dict] = []
 
     for market in state["filtered_markets"]:
         mid = market.market_id
@@ -279,6 +281,8 @@ def run_revision(state: MultiAgentState) -> dict:
         iterations = 0
         current_a_report = a_report
         current_b_report = b_report
+        a_changed = False
+        b_changed = False
 
         while iterations < MAX_REVISION_ITERATIONS:
             rev_out: RevisionAgentOutput = revision_agent(
@@ -320,6 +324,7 @@ def run_revision(state: MultiAgentState) -> dict:
                         "info_holders": a_revision.updated_info_holders,
                         "leak_vectors": a_revision.updated_leak_vectors,
                     }
+                    a_changed = a_changed or a_revision.finding_changed
                     logger.debug(
                         "Revision loop %d/%d for %s (A): finding_changed=%s new_score=%d",
                         iterations, MAX_REVISION_ITERATIONS, mid,
@@ -366,6 +371,7 @@ def run_revision(state: MultiAgentState) -> dict:
                         "reasoning": b_revision.final_reasoning,
                         "context_for_other_agents": b_revision.context_for_other_agents,
                     }
+                    b_changed = b_changed or b_revision.finding_changed
                     logger.debug(
                         "Revision loop %d/%d for %s (B): finding_changed=%s new_score=%d",
                         iterations, MAX_REVISION_ITERATIONS, mid,
@@ -380,7 +386,29 @@ def run_revision(state: MultiAgentState) -> dict:
         rev_out.agent_b_report = current_b_report
         revision_outputs[mid] = rev_out.model_dump()
 
-    logger.info("Revision node complete: %d markets", len(revision_outputs))
+        logger.info(
+            "[revision] market_id=%s  flag=%s  a_changed=%s  b_changed=%s  iters=%d",
+            mid, rev_out.revision_flag, a_changed, b_changed, rev_out.iterations_used,
+        )
+        revision_stats.append({
+            "flag": rev_out.revision_flag,
+            "a_changed": a_changed,
+            "b_changed": b_changed,
+            "iters": rev_out.iterations_used,
+        })
+
+    # Aggregate summary
+    flag_counts = Counter(s["flag"] for s in revision_stats)
+    n = len(revision_stats)
+    avg_iters = sum(s["iters"] for s in revision_stats) / n if n else 0
+    logger.info(
+        "[revision] summary: %d markets | flags: %s | a_changed=%d  b_changed=%d  avg_iters=%.1f",
+        n,
+        "  ".join(f"{k}={v}" for k, v in flag_counts.most_common()),
+        sum(s["a_changed"] for s in revision_stats),
+        sum(s["b_changed"] for s in revision_stats),
+        avg_iters,
+    )
     return {"revision_outputs": revision_outputs}
 
 
@@ -582,9 +610,10 @@ def build_multi_agent_graph():
 
     builder.add_edge(START, "load_markets")
     builder.add_edge("load_markets", "filter_markets")
+    # A and B are fully independent — run in parallel, fan-in at run_revision
     builder.add_edge("filter_markets", "run_agent_a")
-    # A and B are independent — B runs after A but reads no A output
-    builder.add_edge("run_agent_a", "run_agent_b")
+    builder.add_edge("filter_markets", "run_agent_b")
+    builder.add_edge("run_agent_a", "run_revision")
     builder.add_edge("run_agent_b", "run_revision")
     builder.add_edge("run_revision", "run_decision")
     builder.add_edge("run_decision", "export_results")
