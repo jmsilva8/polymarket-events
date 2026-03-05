@@ -31,28 +31,32 @@ import logging
 import sqlite3
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import pandas as pd
+import math
 from tqdm import tqdm
 
 from src.config import DATA_DIR, EXPORTS_DIR
 from src.data_layer.models import PricePoint
 from src.ai_layer.agent_a.agent import agent_a_initial
 from src.ai_layer.agent_a.params import AgentAParams
-from src.ai_layer.agent_a.schemas import AgentAInputPackage
+from src.ai_layer.agent_a.schemas import AgentAInputPackage, _LLMClassificationResponse
 from src.ai_layer.agent_b.agent import agent_b_initial
 from src.ai_layer.agent_b.params import AgentBParams
-from src.ai_layer.agent_b.schemas import AgentBInputPackage
-from src.ai_layer.revision_agent import revision_agent
+from src.ai_layer.agent_b.schemas import AgentBInputPackage, AgentBReport
+from src.ai_layer.revision_agent import revision_agent, RevisionAgentOutput
 from src.ai_layer.decision_agent.agent import decision_agent_deterministic, decision_agent
 from src.ai_layer.decision_agent.params import DecisionAgentParams
 from src.ai_layer.decision_agent.schemas import DecisionAgentInputPackage
 
+from langchain.chat_models import init_chat_model
+from langchain_core.callbacks import BaseCallbackHandler
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -67,7 +71,7 @@ RESULTS_DIR      = BACKTEST_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH      = DATA_DIR / "price_history.db"
-PARQUET_PATH = EXPORTS_DIR / "polymarket_tagged_sample.parquet"
+CSV_PATH = EXPORTS_DIR / "polymarket_tagged_sample.csv"
 
 MAX_REVISION_ITERATIONS = 2  # match graph.py
 
@@ -95,6 +99,66 @@ _rev_loop_lock = threading.Lock()
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
+
+# ── Cost tracking ─────────────────────────────────────────────────────────────
+
+class CostTracker(BaseCallbackHandler):
+    """Thread-safe cumulative token/cost tracker for OpenAI LLM calls."""
+
+    # gpt-4o-mini pricing ($/1M tokens)
+    INPUT_COST_PER_M = 0.15
+    OUTPUT_COST_PER_M = 0.60
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.calls = 0
+        self._stage_snapshots: dict[str, tuple[int, int, int]] = {}
+        self._stage_costs: list[tuple[str, int, float]] = []  # (name, calls, cost)
+
+    def on_llm_end(self, response, **kwargs):
+        usage = (response.llm_output or {}).get("token_usage", {})
+        with self._lock:
+            self.input_tokens += usage.get("prompt_tokens", 0)
+            self.output_tokens += usage.get("completion_tokens", 0)
+            self.calls += 1
+
+    @property
+    def cost(self) -> float:
+        return (
+            self.input_tokens * self.INPUT_COST_PER_M
+            + self.output_tokens * self.OUTPUT_COST_PER_M
+        ) / 1_000_000
+
+    def snapshot(self, stage: str):
+        """Save current counters before a stage begins."""
+        self._stage_snapshots[stage] = (self.input_tokens, self.output_tokens, self.calls)
+
+    def log_stage(self, stage: str):
+        """Log cost delta for one stage + cumulative total."""
+        prev_in, prev_out, prev_calls = self._stage_snapshots.get(stage, (0, 0, 0))
+        d_in = self.input_tokens - prev_in
+        d_out = self.output_tokens - prev_out
+        d_calls = self.calls - prev_calls
+        d_cost = (d_in * self.INPUT_COST_PER_M + d_out * self.OUTPUT_COST_PER_M) / 1_000_000
+        self._stage_costs.append((stage, d_calls, d_cost))
+        logger.info(
+            "Cost [%s]: %d calls | %dk in + %dk out tokens | $%.4f stage | $%.4f cumulative",
+            stage, d_calls, d_in // 1000, d_out // 1000, d_cost, self.cost,
+        )
+
+    def print_summary(self):
+        """Print a final cost summary table."""
+        SEP = "=" * 60
+        print(f"\n{SEP}")
+        print("LLM COST SUMMARY")
+        print("-" * 60)
+        for name, calls, cost in self._stage_costs:
+            print(f"  {name:<16} {calls:>5} calls | ${cost:.4f}")
+        print("-" * 60)
+        print(f"  {'TOTAL':<16} {self.calls:>5} calls | ${self.cost:.4f}")
+        print(f"{SEP}")
 
 
 # ── JSONL helpers ─────────────────────────────────────────────────────────────
@@ -171,16 +235,16 @@ def log_revision_loop(market_id: str, question: str, rev_out: dict) -> None:
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_markets(parquet_path: Path, limit: int | None = None) -> list[dict]:
-    """Load markets from parquet, filtering to closed polymarket markets with outcomes."""
-    df = pd.read_parquet(parquet_path)
-    df = df[df["platform"] == "polymarket"].copy()
-    df = df[df["resolved_yes"].notna()].copy()
-    markets = df.to_dict(orient="records")
+def load_markets(market_path: Path, limit: int | None = None) -> list[dict]:
+    """Load markets from CSV, filtering to closed polymarket markets with outcomes."""
+    with open(market_path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    rows = [r for r in rows if r.get("platform") == "polymarket"]
+    rows = [r for r in rows if r.get("resolved_yes") not in (None, "", "nan")]
     if limit:
-        markets = markets[:limit]
-    logger.info("Loaded %d resolved polymarket markets from parquet", len(markets))
-    return markets
+        rows = rows[:limit]
+    logger.info("Loaded %d resolved polymarket markets from CSV", len(rows))
+    return rows
 
 
 def _parse_end_date(end_str: str) -> datetime | None:
@@ -235,9 +299,9 @@ def _get_price_at(
 def prepare_markets(markets: list[dict], db_path: Path = DB_PATH) -> list[dict]:
     """
     For each market, load price history from SQLite filtered to
-    [end_date − 72h, end_date − 24h] and attach to the dict.
+    [end_date − 120h, end_date − 24h] and attach to the dict.
 
-    Markets with < 5 price points in that window are skipped.
+    Markets with < 3 price points in that window are skipped.
     """
     if not db_path.exists():
         logger.error("SQLite DB not found: %s", db_path)
@@ -255,7 +319,7 @@ def prepare_markets(markets: list[dict], db_path: Path = DB_PATH) -> list[dict]:
                 continue
 
             evaluation_date = end_date - timedelta(hours=24)
-            window_start    = end_date - timedelta(hours=72)
+            window_start    = end_date - timedelta(hours=120)
 
             start_ts = int(window_start.timestamp())
             end_ts   = int(evaluation_date.timestamp())
@@ -264,7 +328,7 @@ def prepare_markets(markets: list[dict], db_path: Path = DB_PATH) -> list[dict]:
             if not price_points:
                 skipped["no_price_data"] += 1
                 continue
-            if len(price_points) < 5:
+            if len(price_points) < 3:
                 skipped["insufficient_points"] += 1
                 continue
 
@@ -326,6 +390,7 @@ def run_stage_agent_a(
     cache: dict,
     max_workers: int = 20,
     skip_llm: bool = False,
+    cost_tracker: CostTracker | None = None,
 ) -> dict:
     """
     Run Agent A for all markets.
@@ -353,6 +418,12 @@ def run_stage_agent_a(
     )
     params = AgentAParams(cache_enabled=True)
 
+    # Create LLM with cost tracking callback (shared across threads — runnables are thread-safe)
+    callbacks = [cost_tracker] if cost_tracker else []
+    structured_llm = init_chat_model(
+        "gpt-4o-mini", temperature=0, model_provider="openai", callbacks=callbacks,
+    ).with_structured_output(_LLMClassificationResponse)
+
     def _run_one(m: dict) -> tuple[str, dict | None]:
         mid = m["market_id"]
         pkg = AgentAInputPackage(
@@ -365,7 +436,7 @@ def run_stage_agent_a(
             end_date=m["end_date"],
         )
         try:
-            report = agent_a_initial(pkg, params)
+            report = agent_a_initial(pkg, params, llm=structured_llm)
             return mid, report.model_dump()
         except Exception as e:
             logger.warning("Agent A failed for %s: %s", mid, e)
@@ -390,6 +461,7 @@ def run_stage_agent_b(
     cache: dict,
     max_workers: int = 20,
     skip_llm: bool = False,
+    cost_tracker: CostTracker | None = None,
 ) -> dict:
     """
     Run Agent B for all markets.
@@ -418,6 +490,12 @@ def run_stage_agent_b(
     )
     b_params = AgentBParams()
 
+    # Create LLM with cost tracking callback
+    callbacks = [cost_tracker] if cost_tracker else []
+    structured_llm = init_chat_model(
+        "gpt-4o-mini", temperature=0, model_provider="openai", callbacks=callbacks,
+    ).with_structured_output(AgentBReport)
+
     def _run_one(m: dict) -> tuple[str, dict | None]:
         mid = m["market_id"]
         try:
@@ -432,7 +510,7 @@ def run_stage_agent_b(
                 volume_total_usd = volume_total,  # final volume as proxy
                 market_age_days  = m["market_age_days"],
             )
-            report = agent_b_initial(pkg, b_params)
+            report = agent_b_initial(pkg, b_params, llm=structured_llm)
             return mid, report.model_dump()
         except Exception as e:
             logger.warning("Agent B failed for %s: %s", mid, e)
@@ -459,6 +537,7 @@ def run_stage_revision(
     cache: dict,
     max_workers: int = 20,
     skip_llm: bool = False,
+    cost_tracker: CostTracker | None = None,
 ) -> dict:
     """
     Run Revision Agent for markets where both A and B reports exist.
@@ -492,12 +571,19 @@ def run_stage_revision(
         len(eligible), len(cache)
     )
 
+    # Create LLM with cost tracking callback
+    callbacks = [cost_tracker] if cost_tracker else []
+    structured_llm = init_chat_model(
+        "gpt-4o-mini", temperature=0, model_provider="openai", callbacks=callbacks,
+    ).with_structured_output(RevisionAgentOutput)
+
     def _run_one(m: dict) -> tuple[str, dict | None]:
         mid = m["market_id"]
         try:
             out = revision_agent(
                 agent_a_report=a_results[mid],
                 agent_b_report=b_results[mid],
+                llm=structured_llm,
             )
             d = out.model_dump()
             # Drop redundant pass-through fields (stored separately in a/b jsonl)
@@ -559,11 +645,11 @@ def run_stage_decisions(
     b_results: dict,
     rev_results: dict,
     run_llm_decision: bool = False,
-) -> dict[str, pd.DataFrame]:
+) -> dict[str, list[dict]]:
     """
     Run all decision configs against the fixed A/B/Revision outputs.
 
-    Returns {config_name: trades_dataframe}.
+    Returns {config_name: list_of_trade_dicts}.
     """
     # Market lookup for price / dates
     market_lookup = {m["market_id"]: m for m in markets}
@@ -572,13 +658,13 @@ def run_stage_decisions(
     if run_llm_decision:
         configs.append({"name": "llm", "params": DecisionAgentParams(), "llm": True})
 
-    all_trades: dict[str, pd.DataFrame] = {}
+    all_trades: dict[str, list[dict]] = {}
 
     for cfg in configs:
         name        = cfg["name"]
         params      = cfg["params"]
         use_llm     = cfg.get("llm", False)
-        trade_rows  = []
+        trade_rows: list[dict] = []
 
         eligible_ids = set(a_results) & set(b_results) & set(rev_results)
 
@@ -639,25 +725,22 @@ def run_stage_decisions(
                 "end_date":        m["end_date"].isoformat(),
             })
 
-        df = pd.DataFrame(trade_rows)
-        all_trades[name] = df
+        all_trades[name] = trade_rows
+        go_count = sum(1 for r in trade_rows if r["decision"] == "GO")
         logger.info(
             "Decision [%s]: %d total  |  %d GO  |  %d SKIP",
-            name,
-            len(df),
-            len(df[df["decision"] == "GO"]) if len(df) > 0 else 0,
-            len(df[df["decision"] == "SKIP"]) if len(df) > 0 else 0,
+            name, len(trade_rows), go_count, len(trade_rows) - go_count,
         )
 
     return all_trades
 
 
-def compute_metrics(df: pd.DataFrame) -> dict:
-    """Compute performance metrics for one config's trade dataframe."""
-    go_df = df[df["decision"] == "GO"].copy()
-    if go_df.empty:
+def compute_metrics(trades: list[dict]) -> dict:
+    """Compute performance metrics for one config's trade list."""
+    go_trades = [r for r in trades if r["decision"] == "GO"]
+    if not go_trades:
         return {
-            "total_markets": len(df),
+            "total_markets": len(trades),
             "total_signals": 0,
             "wins": 0,
             "losses": 0,
@@ -670,66 +753,88 @@ def compute_metrics(df: pd.DataFrame) -> dict:
             "avg_entry_price": None,
         }
 
-    pnl_known = go_df["pnl"].dropna()
-    wins   = (pnl_known > 0).sum()
-    losses = (pnl_known <= 0).sum()
+    pnl_known = [r["pnl"] for r in go_trades if r["pnl"] is not None]
+    wins   = sum(1 for p in pnl_known if p > 0)
+    losses = sum(1 for p in pnl_known if p <= 0)
 
-    total_pnl = pnl_known.sum()
+    total_pnl = sum(pnl_known)
 
     # Stake per trade: YES bet costs entry_price, NO bet costs (1 - entry_price)
-    go_known = go_df.loc[pnl_known.index]
-    effective_stakes = go_known.apply(
-        lambda r: r["entry_price"] if r["bet_direction"] == "YES" else (1.0 - r["entry_price"]),
-        axis=1,
-    )
-    total_stakes = effective_stakes.sum()
-    roi_pct      = (total_pnl / total_stakes * 100) if total_stakes > 0 else None
+    go_with_pnl = [r for r in go_trades if r["pnl"] is not None]
+    effective_stakes = [
+        r["entry_price"] if r["bet_direction"] == "YES" else (1.0 - r["entry_price"])
+        for r in go_with_pnl
+    ]
+    total_stakes = sum(effective_stakes)
+    roi_pct = (total_pnl / total_stakes * 100) if total_stakes > 0 else None
 
     sharpe = None
-    if len(pnl_known) >= 2:
-        std = pnl_known.std(ddof=1)
+    n = len(pnl_known)
+    if n >= 2:
+        mean_pnl = total_pnl / n
+        variance = sum((p - mean_pnl) ** 2 for p in pnl_known) / (n - 1)
+        std = math.sqrt(variance)
         if std > 0:
-            sharpe = round(pnl_known.mean() / std, 3)
+            sharpe = round(mean_pnl / std, 3)
 
     # Max drawdown on cumulative P&L
-    cum = pnl_known.cumsum()
-    rolling_max = cum.cummax()
-    drawdowns = rolling_max - cum
-    max_dd = drawdowns.max() if len(drawdowns) > 0 else 0.0
+    max_dd = 0.0
+    cum = 0.0
+    peak = 0.0
+    for p in pnl_known:
+        cum += p
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
+        if dd > max_dd:
+            max_dd = dd
+
+    entry_prices = [r["entry_price"] for r in go_trades]
 
     return {
-        "total_markets":  len(df),
-        "total_signals":  len(go_df),
-        "wins":           int(wins),
-        "losses":         int(losses),
-        "win_rate":       round(wins / len(pnl_known), 4) if len(pnl_known) > 0 else None,
+        "total_markets":  len(trades),
+        "total_signals":  len(go_trades),
+        "wins":           wins,
+        "losses":         losses,
+        "win_rate":       round(wins / n, 4) if n > 0 else None,
         "total_pnl":      round(total_pnl, 4),
-        "avg_pnl":        round(pnl_known.mean(), 4) if len(pnl_known) > 0 else None,
+        "avg_pnl":        round(total_pnl / n, 4) if n > 0 else None,
         "roi_pct":        round(roi_pct, 2) if roi_pct is not None else None,
         "sharpe":         sharpe,
         "max_drawdown":   round(max_dd, 4),
-        "avg_entry_price": round(go_df["entry_price"].mean(), 4),
+        "avg_entry_price": round(sum(entry_prices) / len(entry_prices), 4),
     }
 
 
-def export_results(all_trades: dict[str, pd.DataFrame], markets: list[dict]) -> None:
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    """Write a list of dicts to CSV."""
+    if not rows:
+        path.write_text("")
+        return
+    fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def export_results(all_trades: dict[str, list[dict]], markets: list[dict]) -> None:
     """Save per-config trade CSVs and a master summary CSV."""
     summary_rows = []
 
-    for cfg_name, df in all_trades.items():
+    for cfg_name, trades in all_trades.items():
         # Save individual trades
         trade_path = RESULTS_DIR / f"{cfg_name}_trades.csv"
-        df.to_csv(trade_path, index=False)
-        logger.info("  Saved %d rows → %s", len(df), trade_path)
+        _write_csv(trade_path, trades)
+        logger.info("  Saved %d rows → %s", len(trades), trade_path)
 
         # Compute metrics
-        m = compute_metrics(df)
+        m = compute_metrics(trades)
         summary_rows.append({"config": cfg_name, **m})
 
     # Save summary
-    summary_df = pd.DataFrame(summary_rows)
     summary_path = RESULTS_DIR / "all_configs_summary.csv"
-    summary_df.to_csv(summary_path, index=False)
+    _write_csv(summary_path, summary_rows)
     logger.info("Saved summary → %s", summary_path)
 
     # Print leaderboard
@@ -737,17 +842,17 @@ def export_results(all_trades: dict[str, pd.DataFrame], markets: list[dict]) -> 
     print(f"\n{SEP}")
     print("DECISION CONFIG LEADERBOARD")
     print("-" * 90)
-    go_rows = summary_df[summary_df["total_signals"] > 0].copy()
-    if go_rows.empty:
+    go_rows = [r for r in summary_rows if r["total_signals"] > 0]
+    if not go_rows:
         print("  No configs produced GO signals.")
     else:
-        go_rows = go_rows.sort_values("roi_pct", ascending=False)
+        go_rows.sort(key=lambda r: r["roi_pct"] if r["roi_pct"] is not None else float("-inf"), reverse=True)
         print(
             f"  {'Config':<22} {'Signals':>8} {'WinRate':>8} {'ROI%':>8} "
             f"{'Sharpe':>8} {'MaxDD':>8}"
         )
         print("-" * 90)
-        for _, row in go_rows.iterrows():
+        for row in go_rows:
             wr  = f"{row['win_rate']:.1%}" if row["win_rate"] is not None else "—"
             roi = f"{row['roi_pct']:.1f}%" if row["roi_pct"] is not None else "—"
             sh  = f"{row['sharpe']:.2f}"   if row["sharpe"]  is not None else "—"
@@ -769,7 +874,7 @@ def print_funnel(
     a_count: int,
     b_count: int,
     rev_count: int,
-    all_trades: dict[str, pd.DataFrame],
+    all_trades: dict[str, list[dict]],
 ) -> None:
     print("\n" + "=" * 60)
     print("SIGNAL FUNNEL")
@@ -779,10 +884,9 @@ def print_funnel(
     print(f"  Agent A completed:               {a_count:>6}")
     print(f"  Agent B completed:               {b_count:>6}")
     print(f"  Revision completed:              {rev_count:>6}")
-    for name, df in all_trades.items():
-        go = len(df[df["decision"] == "GO"]) if len(df) > 0 else 0
-        pnl_df = df[(df["decision"] == "GO") & df["pnl"].notna()]
-        wins = int((pnl_df["pnl"] > 0).sum()) if len(pnl_df) > 0 else 0
+    for name, trades in all_trades.items():
+        go = sum(1 for r in trades if r["decision"] == "GO")
+        wins = sum(1 for r in trades if r["decision"] == "GO" and r.get("pnl") is not None and r["pnl"] > 0)
         print(
             f"  [{name:<20}]  GO={go:>4}  Wins={wins:>4}"
         )
@@ -801,10 +905,10 @@ def parse_args() -> argparse.Namespace:
                    help="Skip all LLM stages, run decisions on existing cache")
     p.add_argument("--llm-decision",   action="store_true",
                    help="Also run LLM-based decision for GO_EVALUATE markets")
-    p.add_argument("--workers",        type=int, default=20,
-                   help="ThreadPoolExecutor workers per LLM stage (default 20)")
-    p.add_argument("--parquet",        type=Path, default=PARQUET_PATH,
-                   help=f"Markets parquet path (default: {PARQUET_PATH})")
+    p.add_argument("--workers",        type=int, default=4,
+                   help="ThreadPoolExecutor workers per LLM stage (default 4)")
+    p.add_argument("--csv",            type=Path, default=CSV_PATH,
+                   help=f"Markets CSV path (default: {CSV_PATH})")
     p.add_argument("--db",             type=Path, default=DB_PATH,
                    help=f"SQLite price history path (default: {DB_PATH})")
     return p.parse_args()
@@ -813,10 +917,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     skip_llm = args.skip_llm or args.decisions_only
+    tracker = CostTracker()
 
     # ── Stage 1: Load markets ─────────────────────────────────────────────────
     logger.info("Stage 1: Loading markets")
-    all_markets = load_markets(args.parquet, limit=args.limit)
+    all_markets = load_markets(args.csv, limit=args.limit)
     total_in_csv = len(all_markets)
 
     # ── Stage 2: Filter to markets with price data ────────────────────────────
@@ -836,24 +941,37 @@ def main() -> None:
         "  Cached: A=%d  B=%d  Rev=%d", len(a_cache), len(b_cache), len(rev_cache)
     )
 
-    # ── Stage 3: Agent A ──────────────────────────────────────────────────────
-    logger.info("Stage 3: Agent A")
-    a_results = run_stage_agent_a(
-        markets, a_cache, max_workers=args.workers, skip_llm=skip_llm
-    )
+    # ── Stage 3+4: Agent A & B (concurrent) ────────────────────────────────────
+    logger.info("Stage 3+4: Agent A & B (running concurrently)")
+    tracker.snapshot("Agent A")
+    tracker.snapshot("Agent B")
 
-    # ── Stage 4: Agent B ──────────────────────────────────────────────────────
-    logger.info("Stage 4: Agent B")
-    b_results = run_stage_agent_b(
-        markets, b_cache, max_workers=args.workers, skip_llm=skip_llm
-    )
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="stage") as stage_pool:
+        fut_a = stage_pool.submit(
+            run_stage_agent_a,
+            markets, a_cache, max_workers=args.workers, skip_llm=skip_llm,
+            cost_tracker=tracker,
+        )
+        fut_b = stage_pool.submit(
+            run_stage_agent_b,
+            markets, b_cache, max_workers=args.workers, skip_llm=skip_llm,
+            cost_tracker=tracker,
+        )
+        a_results = fut_a.result()
+        b_results = fut_b.result()
+
+    tracker.log_stage("Agent A")
+    tracker.log_stage("Agent B")
 
     # ── Stage 5: Revision ─────────────────────────────────────────────────────
     logger.info("Stage 5: Revision")
+    tracker.snapshot("Revision")
     rev_results = run_stage_revision(
         markets, a_results, b_results, rev_cache,
         max_workers=args.workers, skip_llm=skip_llm,
+        cost_tracker=tracker,
     )
+    tracker.log_stage("Revision")
 
     # ── Stage 6: Decisions ────────────────────────────────────────────────────
     logger.info("Stage 6: Running %d decision configs", len(DECISION_CONFIGS))
@@ -875,6 +993,7 @@ def main() -> None:
         all_trades,
     )
 
+    tracker.print_summary()
     logger.info("Done. Run `python scripts/plot_backtest_v2.py` to generate charts.")
 
 
