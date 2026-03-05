@@ -54,6 +54,19 @@ ENTERTAINMENT_TAG_LABELS = [
     "spotify", "tiktok", "pop culture", "poker",
 ]
 
+# Tag slugs to download from Polymarket Gamma API.
+# Curated whitelist excluding crypto, sports, politics, and elections.
+DOWNLOAD_TAG_SLUGS = [
+    # Culture & entertainment
+    "pop-culture", "celebrities", "movies", "awards", "youtube",
+    # Business & finance
+    "business", "finance", "equities", "stocks", "earnings", "trade", "tariffs",
+    # Science & technology
+    "science", "ai", "tech", "big-tech", "nasa", "space-exploration",
+    # World & current events
+    "world", "middle-east", "breaking-news", "economy",
+]
+
 # ── Ensure directories exist ──────────────────────────────────────
 for _dir in [
     CACHE_DIR / "events",

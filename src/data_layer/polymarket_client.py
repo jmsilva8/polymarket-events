@@ -104,19 +104,23 @@ class PolymarketClient(BaseMarketClient):
         limit: int = 100,
         offset: int = 0,
         tag_id: Optional[int] = None,
+        tag_slug: Optional[str] = None,
         end_date_min: Optional[str] = None,
         end_date_max: Optional[str] = None,
         volume_min: Optional[float] = None,
+        ascending: bool = True,
     ) -> list[UnifiedEvent]:
         params: dict = {
             "closed": "true",
             "limit": limit,
             "offset": offset,
             "order": "endDate",
-            "ascending": "false",
+            "ascending": str(ascending).lower(),
         }
         if tag_id is not None:
             params["tag_id"] = tag_id
+        if tag_slug is not None:
+            params["tag_slug"] = tag_slug
         if end_date_min:
             params["end_date_min"] = end_date_min
         if end_date_max:
@@ -135,9 +139,11 @@ class PolymarketClient(BaseMarketClient):
     def get_all_closed_events(
         self,
         tag_id: Optional[int] = None,
+        tag_slug: Optional[str] = None,
         end_date_min: Optional[str] = None,
         end_date_max: Optional[str] = None,
         volume_min: Optional[float] = None,
+        ascending: bool = True,
         max_pages: int = 100,
         cache_key: Optional[str] = None,
     ) -> list[UnifiedEvent]:
@@ -150,9 +156,11 @@ class PolymarketClient(BaseMarketClient):
         return self._paginate(
             self.get_closed_events,
             tag_id=tag_id,
+            tag_slug=tag_slug,
             end_date_min=end_date_min,
             end_date_max=end_date_max,
             volume_min=volume_min,
+            ascending=ascending,
             max_pages=max_pages,
             cache_key=cache_key,
         )
@@ -320,9 +328,11 @@ class PolymarketClient(BaseMarketClient):
         outcomes = _parse_json_list_strings(raw.get("outcomes", '["Yes","No"]'))
         clob_token_ids = _parse_json_list_strings(raw.get("clobTokenIds", "[]"))
 
+        # Markets don't have their own tags in the API; inherit from parent event.
+        tag_source = raw.get("tags") or (event_context or {}).get("tags", [])
         tags = [
             Tag(id=t.get("id", 0), label=t.get("label", ""), slug=t.get("slug", ""))
-            for t in raw.get("tags", [])
+            for t in tag_source
         ]
 
         if raw.get("closed"):
