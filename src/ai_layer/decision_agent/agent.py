@@ -27,6 +27,14 @@ from src.ai_layer.decision_agent.schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _provider(model: str) -> str:
+    if model.startswith(("gpt-", "o1-", "o3-", "o4-")):
+        return "openai"
+    elif model.startswith("claude-"):
+        return "anthropic"
+    raise ValueError(f"Cannot determine provider for model: {model!r}")
+
+
 def decision_agent(
     package: DecisionAgentInputPackage,
     params: DecisionAgentParams,
@@ -85,7 +93,7 @@ def decision_agent(
     llm = init_chat_model(
         params.model_name,
         temperature=params.temperature,
-        model_provider="anthropic",
+        model_provider=_provider(params.model_name),
     )
     user_prompt = build_decision_agent_prompt(package)
 
@@ -239,4 +247,134 @@ def _summarize(parsed: dict) -> str:
     return (
         f"Recommend PASS. Edge not meaningful "
         f"(~{parsed['edge_pp']:.1f}pp). Risk/reward insufficient."
+    )
+
+
+# ── Deterministic decision combiner ───────────────────────────────────────────
+
+def decision_agent_deterministic(
+    package: DecisionAgentInputPackage,
+    params: DecisionAgentParams,
+) -> DecisionAgentOutput:
+    """
+    Deterministic GO/SKIP decision — no LLM call.
+
+    Combines Agent A and B scores with fixed weights and thresholds.
+    All parameters are tunable via DecisionAgentParams for backtesting sweeps.
+
+    Edge formula: edge_pp = (weighted_score - 5) / 5 * max_edge_pp
+    This gives 0pp at score=5 (no signal), max_edge_pp at score=10.
+    Bet direction always comes from Agent B's signal_direction.
+    """
+    eval_date = package.evaluation_date.isoformat()
+
+    def _skip(reason: str, action: str = "PASS") -> DecisionAgentOutput:
+        return DecisionAgentOutput(
+            decision="SKIP",
+            bet_direction="null",
+            full_reasoning=reason,
+            revision_flag_applied=package.revision_flag,
+            market_id=package.market_id,
+            evaluation_date=eval_date,
+            recommendation={
+                "action": action,
+                "bet": None,
+                "risk_grade": 0,
+                "current_price": package.current_market_price,
+                "reasoning_summary": reason,
+            },
+        )
+
+    # 1. Validate price
+    if not (0.0 <= package.current_market_price <= 1.0):
+        return _skip("Invalid market price. Defaulting to SKIP.")
+
+    # 2. Honour Revision Agent hard decisions
+    if package.recommendation_to_decision_agent == "SKIP":
+        return _skip(
+            f"Revision Agent: SKIP. {package.flag_explanation}", action="PASS"
+        )
+    if package.recommendation_to_decision_agent == "WATCH":
+        return _skip(
+            f"Revision Agent: WATCH. {package.flag_explanation}", action="WATCH"
+        )
+
+    # 3. Extract scores
+    a_score = package.agent_a_report.get("insider_risk_score", 1)
+    b_score = package.agent_b_report.get("behavior_score", 1)
+    signal_direction = package.agent_b_report.get("signal_direction", "SKIP")
+
+    # 4. Score gates
+    if a_score < params.min_a_score:
+        return _skip(
+            f"Agent A score {a_score} below minimum {params.min_a_score}. SKIP."
+        )
+    if b_score < params.min_b_score:
+        return _skip(
+            f"Agent B score {b_score} below minimum {params.min_b_score}. SKIP."
+        )
+
+    # 5. B must have a directional signal
+    if signal_direction == "SKIP":
+        return _skip("Agent B has no directional signal. SKIP.")
+
+    # 6. Weighted score
+    weighted_score = round(params.weight_a * a_score + params.weight_b * b_score, 2)
+
+    # 7. Score threshold
+    if weighted_score < params.go_score_threshold:
+        return _skip(
+            f"Weighted score {weighted_score:.2f} below threshold "
+            f"{params.go_score_threshold}. SKIP."
+        )
+
+    # 8. Edge estimate: linear from 0pp at score=5 to max_edge_pp at score=10
+    raw_edge = max(0.0, (weighted_score - 5.0) / 5.0) * params.max_edge_pp
+    direction_sign = 1 if signal_direction == "YES" else -1
+    adjusted_prob = package.current_market_price + direction_sign * raw_edge / 100
+    adjusted_prob = max(0.01, min(0.99, adjusted_prob))
+    edge_pp = abs(adjusted_prob - package.current_market_price) * 100
+
+    # 9. Edge threshold
+    if edge_pp < params.min_edge_pp:
+        return _skip(
+            f"Estimated edge {edge_pp:.1f}pp below minimum {params.min_edge_pp}pp. SKIP."
+        )
+
+    # 10. GO
+    reasoning = (
+        f"GO: A={a_score} B={b_score} → weighted={weighted_score:.2f} "
+        f"(threshold={params.go_score_threshold}). "
+        f"Signal={signal_direction}. Edge≈{edge_pp:.1f}pp "
+        f"(price={package.current_market_price:.2f} → adj={adjusted_prob:.2f})."
+    )
+    return DecisionAgentOutput(
+        decision="GO",
+        bet_direction=signal_direction,
+        analysis={
+            "agent_a_score": a_score,
+            "agent_b_score": b_score,
+            "weight_a_percentage": int(params.weight_a * 100),
+            "weight_b_percentage": int(params.weight_b * 100),
+            "weighting_rationale": f"Fixed weights: A={params.weight_a:.0%} B={params.weight_b:.0%}",
+            "weighted_score": weighted_score,
+            "current_market_price": package.current_market_price,
+            "adjusted_probability_of_win": adjusted_prob,
+            "estimated_edge_pp": round(edge_pp, 2),
+            "edge_assessment": "meaningful",
+        },
+        full_reasoning=reasoning,
+        revision_flag_applied=package.revision_flag,
+        market_id=package.market_id,
+        evaluation_date=eval_date,
+        recommendation={
+            "action": "INVEST",
+            "bet": signal_direction,
+            "risk_grade": int(round(weighted_score)),
+            "current_price": package.current_market_price,
+            "reasoning_summary": (
+                f"INVEST {signal_direction} — weighted score {weighted_score:.1f}, "
+                f"~{edge_pp:.1f}pp estimated edge."
+            ),
+        },
     )

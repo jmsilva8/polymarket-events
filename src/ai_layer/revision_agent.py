@@ -7,7 +7,7 @@ validates coherence, detects cross-patterns, routes to Decision Agent.
 Design decisions (non-negotiable):
   - temperature=0 for backtesting reproducibility
   - Structured output binding via .with_structured_output()
-  - Max 5 feedback iterations per market (managed by graph node)
+  - Max 2 feedback iterations per market (managed by graph node)
   - PUBLIC_INFO_ADJUSTED and PRE_SIGNAL → autonomous SKIP/WATCH decisions
   - DIRECTIONAL_CONFLICT → GO_EVALUATE (Decision Agent resolves via weighting)
 """
@@ -20,7 +20,15 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_MODEL = "gpt-4o-mini"  # fallback: claude-haiku-4-5-20251001
+
+
+def _provider(model: str) -> str:
+    if model.startswith(("gpt-", "o1-", "o3-", "o4-")):
+        return "openai"
+    elif model.startswith("claude-"):
+        return "anthropic"
+    raise ValueError(f"Cannot determine provider for model: {model!r}")
 
 
 # ── Output schema ──────────────────────────────────────────────────────────────
@@ -195,7 +203,7 @@ def revision_agent(
     """
     if llm is None:
         llm = init_chat_model(
-            model, temperature=0, model_provider="anthropic"
+            model, temperature=0, model_provider=_provider(model)
         ).with_structured_output(RevisionAgentOutput)
 
     user_prompt = _build_user_prompt(agent_a_report, agent_b_report)

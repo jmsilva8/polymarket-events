@@ -2,7 +2,7 @@
 Agent B entry points: agent_b_initial() and agent_b_revise().
 
 LLM config:
-  - Model: claude-haiku-4-5-20251001 (primary)
+  - Model: gpt-4o-mini (primary); claude-haiku-4-5-20251001 (fallback)
   - temperature: 0 (mandatory for reproducibility)
   - structured output via .with_structured_output()
 """
@@ -37,7 +37,15 @@ from src.ai_layer.agent_b.tools import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_MODEL = "gpt-4o-mini"
+
+
+def _provider(model: str) -> str:
+    if model.startswith(("gpt-", "o1-", "o3-", "o4-")):
+        return "openai"
+    elif model.startswith("claude-"):
+        return "anthropic"
+    raise ValueError(f"Cannot determine provider for model: {model!r}")
 
 # Fallback report for when the LLM or data fails entirely
 _SKIP_REPORT_DEFAULTS = {
@@ -56,13 +64,13 @@ _SKIP_REPORT_DEFAULTS = {
 def _make_llm(model: str = DEFAULT_MODEL):
     """Initialize LangChain LLM with structured output bound."""
     return init_chat_model(
-        model, temperature=0, model_provider="anthropic"
+        model, temperature=0, model_provider=_provider(model)
     ).with_structured_output(AgentBReport)
 
 
 def _make_revision_llm(model: str = DEFAULT_MODEL):
     return init_chat_model(
-        model, temperature=0, model_provider="anthropic"
+        model, temperature=0, model_provider=_provider(model)
     ).with_structured_output(AgentBRevisionResponse)
 
 

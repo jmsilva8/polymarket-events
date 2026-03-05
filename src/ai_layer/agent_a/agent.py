@@ -21,6 +21,14 @@ from typing import Optional
 from langchain.chat_models import init_chat_model
 
 from src.config import CACHE_DIR
+
+
+def _provider(model: str) -> str:
+    if model.startswith(("gpt-", "o1-", "o3-", "o4-")):
+        return "openai"
+    elif model.startswith("claude-"):
+        return "anthropic"
+    raise ValueError(f"Cannot determine provider for model: {model!r}")
 from src.ai_layer.agent_a.params import AgentAParams
 from src.ai_layer.agent_a.schemas import (
     AgentAInputPackage,
@@ -44,7 +52,7 @@ def _get_llm(params: AgentAParams, output_schema):
     return init_chat_model(
         params.model_name,
         temperature=params.temperature,
-        model_provider="anthropic",
+        model_provider=_provider(params.model_name),
     ).with_structured_output(output_schema)
 
 

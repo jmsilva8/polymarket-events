@@ -8,7 +8,7 @@ Graph topology (multi-agent):
       → filter_markets
       → run_agent_a          (insider risk scoring — text-based, sees market content)
       → run_agent_b          (quantitative signals — blind, price/momentum only)
-      → run_revision         (cross-pattern QA + feedback loop, max 5 iterations)
+      → run_revision         (cross-pattern QA + feedback loop, max 2 iterations)
       → run_decision         (final GO/SKIP with Bayesian weighting)
       → export_results
     END
@@ -37,7 +37,7 @@ from src.ai_layer.agent_a.schemas import AgentAInputPackage, AgentAReport
 from src.ai_layer.agent_b.agent import agent_b_initial, agent_b_revise
 from src.ai_layer.agent_b.params import AgentBParams
 from src.ai_layer.agent_b.schemas import AgentBInputPackage, AgentBReport
-from src.ai_layer.decision_agent.agent import decision_agent
+from src.ai_layer.decision_agent.agent import decision_agent, decision_agent_deterministic
 from src.ai_layer.decision_agent.params import DecisionAgentParams
 from src.ai_layer.decision_agent.schemas import (
     DecisionAgentInputPackage,
@@ -49,7 +49,7 @@ from src.data_layer.models import MarketStatus, Platform, Tag, UnifiedMarket
 
 logger = logging.getLogger(__name__)
 
-MAX_REVISION_ITERATIONS = 5
+MAX_REVISION_ITERATIONS = 2
 
 
 # ── Graph State ────────────────────────────────────────────────────────────────
@@ -61,11 +61,13 @@ class MultiAgentState(TypedDict):
     polymarket_csv: str
     kalshi_csv: str
     volume_threshold: float
-    primary_model: str          # Agent A LLM
-    agent_b_model: str          # Agent B LLM
-    revision_model: str         # Revision Agent LLM
-    decision_model: str         # Decision Agent LLM
+    primary_model: str          # Agent A LLM (default: gpt-4o-mini)
+    agent_b_model: str          # Agent B LLM (default: gpt-4o-mini)
+    revision_model: str         # Revision Agent LLM (default: gpt-4o-mini)
+    decision_model: str         # Decision Agent LLM for LLM-based version (default: gpt-4o-mini)
     export_path: str
+    # When True: also runs LLM-based decision agent for comparison alongside deterministic
+    compare_decision_methods: bool
 
     # Intermediate — populated by load/filter nodes
     all_markets: list           # list[UnifiedMarket]
@@ -75,7 +77,8 @@ class MultiAgentState(TypedDict):
     agent_a_reports: dict       # dict[str, dict]  (AgentAReport serialized)
     agent_b_reports: dict       # dict[str, dict]  (AgentBReport serialized)
     revision_outputs: dict      # dict[str, dict]  (RevisionAgentOutput serialized)
-    decision_outputs: dict      # dict[str, dict]  (DecisionAgentOutput serialized)
+    decision_outputs: dict      # dict[str, dict]  (DecisionAgentOutput — deterministic, primary)
+    decision_outputs_llm: dict  # dict[str, dict]  (DecisionAgentOutput — LLM-based, comparison)
 
     # Final
     summary: dict
@@ -147,7 +150,7 @@ def run_agent_a(state: MultiAgentState) -> dict:
     Sees market title, description, category, tags — blind to price data.
     """
     params = AgentAParams(
-        model_name=state.get("primary_model", "claude-haiku-4-5-20251001"),
+        model_name=state.get("primary_model", "gpt-4o-mini"),
         cache_enabled=True,
     )
     agent_a_reports: dict[str, dict] = {}
@@ -259,9 +262,9 @@ def run_revision(state: MultiAgentState) -> dict:
        - Re-run revision_agent with updated reports
     3. Repeat up to MAX_REVISION_ITERATIONS total
     """
-    revision_model = state.get("revision_model", "claude-haiku-4-5-20251001")
+    revision_model = state.get("revision_model", "gpt-4o-mini")
     agent_a_params = AgentAParams(
-        model_name=state.get("primary_model", "claude-haiku-4-5-20251001"),
+        model_name=state.get("primary_model", "gpt-4o-mini"),
         cache_enabled=False,  # Don't cache revision outputs — they differ from initial
     )
     agent_b_params = AgentBParams()
@@ -384,12 +387,30 @@ def run_revision(state: MultiAgentState) -> dict:
 # ── Node: run_decision ─────────────────────────────────────────────────────────
 
 def run_decision(state: MultiAgentState) -> dict:
-    """Decision Agent: final GO/SKIP with Bayesian weighting."""
-    params = DecisionAgentParams(
-        model_name=state.get("decision_model", "claude-haiku-4-5-20251001")
+    """
+    Decision Agent: deterministic GO/SKIP (primary) + optional LLM comparison.
+
+    Always runs decision_agent_deterministic() — this is what backtesting sweeps.
+    Also runs the LLM-based decision_agent() if compare_decision_methods=True.
+    """
+    det_params = DecisionAgentParams(
+        model_name=state.get("decision_model", "gpt-4o-mini")
     )
     now = datetime.now(timezone.utc)
+    compare = state.get("compare_decision_methods", False)
+
     decision_outputs: dict[str, dict] = {}
+    decision_outputs_llm: dict[str, dict] = {}
+
+    _error_fallback = lambda mid, rev, e: {
+        "market_id": mid,
+        "decision": "SKIP",
+        "bet_direction": "null",
+        "full_reasoning": f"Decision Agent error: {e}",
+        "revision_flag_applied": rev.get("revision_flag", "NONE"),
+        "recommendation": {"action": "PASS"},
+        "evaluation_date": now.isoformat(),
+    }
 
     for market in state["filtered_markets"]:
         mid = market.market_id
@@ -410,29 +431,41 @@ def run_decision(state: MultiAgentState) -> dict:
                 end_date=market.end_date or now,
                 market_id=mid,
             )
-            output: DecisionAgentOutput = decision_agent(package, params)
-            decision_outputs[mid] = output.model_dump()
+
+            # Primary: deterministic (always runs)
+            det_output = decision_agent_deterministic(package, det_params)
+            decision_outputs[mid] = det_output.model_dump()
+
+            # Comparison: LLM-based (optional)
+            if compare:
+                try:
+                    llm_output = decision_agent(package, det_params)
+                    decision_outputs_llm[mid] = llm_output.model_dump()
+                except Exception as e:
+                    logger.error("LLM Decision Agent failed for %s: %s", mid, e)
+                    decision_outputs_llm[mid] = _error_fallback(mid, rev, e)
 
         except Exception as e:
             logger.error("Decision Agent failed for %s: %s", mid, e)
-            decision_outputs[mid] = {
-                "market_id": mid,
-                "decision": "SKIP",
-                "bet_direction": "null",
-                "full_reasoning": f"Decision Agent error: {e}",
-                "revision_flag_applied": rev.get("revision_flag", "NONE"),
-                "recommendation": {"action": "PASS"},
-                "evaluation_date": now.isoformat(),
-            }
+            decision_outputs[mid] = _error_fallback(mid, rev, e)
 
-    logger.info("Decision node complete: %d markets", len(decision_outputs))
-    return {"decision_outputs": decision_outputs}
+    logger.info(
+        "Decision node complete: %d markets (LLM comparison: %s)",
+        len(decision_outputs), compare,
+    )
+    return {
+        "decision_outputs": decision_outputs,
+        "decision_outputs_llm": decision_outputs_llm,
+    }
 
 
 # ── Node: export_results ───────────────────────────────────────────────────────
 
 def export_results(state: MultiAgentState) -> dict:
     """Export final decisions to CSV and compute summary stats."""
+    llm_outputs = state.get("decision_outputs_llm", {})
+    compare = bool(llm_outputs)
+
     rows = []
     for market in state["filtered_markets"]:
         mid = market.market_id
@@ -441,7 +474,7 @@ def export_results(state: MultiAgentState) -> dict:
         rev = state["revision_outputs"].get(mid, {})
         dec = state["decision_outputs"].get(mid, {})
 
-        rows.append({
+        row = {
             "market_id": mid,
             "market_question": market.question,
             "platform": market.platform.value,
@@ -459,13 +492,26 @@ def export_results(state: MultiAgentState) -> dict:
             "revision_flag": rev.get("revision_flag"),
             "revision_recommendation": rev.get("recommendation_to_decision_agent"),
             "revision_iterations": rev.get("iterations_used", 0),
-            # Decision
+            # Decision — deterministic (primary)
             "decision": dec.get("decision"),
             "bet_direction": dec.get("bet_direction"),
             "weighted_score": dec.get("analysis", {}).get("weighted_score"),
             "estimated_edge_pp": dec.get("analysis", {}).get("estimated_edge_pp"),
             "action": dec.get("recommendation", {}).get("action"),
-        })
+        }
+
+        # Decision — LLM comparison (optional)
+        if compare:
+            llm = llm_outputs.get(mid, {})
+            row["llm_decision"] = llm.get("decision")
+            row["llm_bet_direction"] = llm.get("bet_direction")
+            row["llm_weighted_score"] = llm.get("analysis", {}).get("weighted_score")
+            row["llm_estimated_edge_pp"] = llm.get("analysis", {}).get("estimated_edge_pp")
+            row["llm_action"] = llm.get("recommendation", {}).get("action")
+            # Flag disagreements
+            row["decision_disagree"] = row["decision"] != row["llm_decision"]
+
+        rows.append(row)
 
     export_path = state.get(
         "export_path", str(EXPORTS_DIR / "multi_agent_decisions.csv")
@@ -501,6 +547,17 @@ def export_results(state: MultiAgentState) -> dict:
         ],
         "export_path": export_path,
     }
+
+    if compare:
+        disagree_count = sum(1 for r in rows if r.get("decision_disagree"))
+        summary["llm_comparison"] = {
+            "llm_go_count": sum(1 for r in rows if r.get("llm_decision") == "GO"),
+            "llm_skip_count": sum(1 for r in rows if r.get("llm_decision") == "SKIP"),
+            "disagreements": disagree_count,
+            "agreement_rate_pct": round(
+                100 * (1 - disagree_count / max(len(rows), 1)), 1
+            ),
+        }
 
     logger.info(
         "Export complete: %d markets → %d GO / %d SKIP — saved to %s",

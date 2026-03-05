@@ -23,6 +23,11 @@ def assess_inputs(
             f"Price jump and momentum tools skipped."
         )
         skipped.extend(["price_jump_detector", "momentum_analyzer"])
+    elif params.data_frequency_hours >= 12:
+        notes.append(
+            f"Sparse data: {len(package.price_history)} points at ~{params.data_frequency_hours}h intervals. "
+            f"Jump detection is the primary signal — momentum regression has limited reliability."
+        )
 
     if package.volume_history and len(package.volume_history) >= 7:
         volume_mode = "timeseries"
