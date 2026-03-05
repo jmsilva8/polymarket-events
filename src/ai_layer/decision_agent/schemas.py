@@ -21,7 +21,7 @@ class DecisionAgentInputPackage:
         "DIRECTIONAL_CONFLICT",
     ]
     flag_explanation: str
-    agent_a_report: dict    # Full MarketClassification serialized
+    agent_a_report: dict    # Full AgentAReport serialized
     agent_b_report: dict    # Full AgentBReport serialized
     revision_notes: str
     recommendation_to_decision_agent: Literal["GO_EVALUATE", "SKIP", "WATCH"]

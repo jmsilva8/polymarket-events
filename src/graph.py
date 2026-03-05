@@ -31,10 +31,12 @@ from typing import Optional, TypedDict
 import pandas as pd
 from langgraph.graph import END, START, StateGraph
 
+from src.ai_layer.agent_a.agent import agent_a_initial, agent_a_revise
+from src.ai_layer.agent_a.params import AgentAParams
+from src.ai_layer.agent_a.schemas import AgentAInputPackage, AgentAReport
 from src.ai_layer.agent_b.agent import agent_b_initial, agent_b_revise
 from src.ai_layer.agent_b.params import AgentBParams
 from src.ai_layer.agent_b.schemas import AgentBInputPackage, AgentBReport
-from src.ai_layer.classifier import MarketClassifier
 from src.ai_layer.decision_agent.agent import decision_agent
 from src.ai_layer.decision_agent.params import DecisionAgentParams
 from src.ai_layer.decision_agent.schemas import (
@@ -42,7 +44,6 @@ from src.ai_layer.decision_agent.schemas import (
     DecisionAgentOutput,
 )
 from src.ai_layer.revision_agent import RevisionAgentOutput, revision_agent
-from src.ai_layer.schemas import MarketClassification
 from src.config import EXPORTS_DIR, MIN_VOLUME_USD
 from src.data_layer.models import MarketStatus, Platform, Tag, UnifiedMarket
 
@@ -71,7 +72,7 @@ class MultiAgentState(TypedDict):
     filtered_markets: list      # list[UnifiedMarket]
 
     # Agent outputs — dicts keyed by market_id
-    agent_a_reports: dict       # dict[str, dict]  (MarketClassification serialized)
+    agent_a_reports: dict       # dict[str, dict]  (AgentAReport serialized)
     agent_b_reports: dict       # dict[str, dict]  (AgentBReport serialized)
     revision_outputs: dict      # dict[str, dict]  (RevisionAgentOutput serialized)
     decision_outputs: dict      # dict[str, dict]  (DecisionAgentOutput serialized)
@@ -143,19 +144,27 @@ def filter_markets(state: MultiAgentState) -> dict:
 def run_agent_a(state: MultiAgentState) -> dict:
     """
     Agent A: insider risk scoring via text analysis.
-    Uses the existing MarketClassifier (archetype + LLM).
-    Sees market title, description, tags — blind to price data.
+    Sees market title, description, category, tags — blind to price data.
     """
-    classifier = MarketClassifier(
-        primary_model=state.get("primary_model", "haiku"),
+    params = AgentAParams(
+        model_name=state.get("primary_model", "claude-haiku-4-5-20251001"),
         cache_enabled=True,
     )
     agent_a_reports: dict[str, dict] = {}
 
     for market in state["filtered_markets"]:
         try:
-            result: MarketClassification = classifier.classify(market)
-            agent_a_reports[market.market_id] = result.model_dump()
+            package = AgentAInputPackage(
+                market_id=market.market_id,
+                question=market.question,
+                description=market.description or "",
+                category=market.category or "",
+                tags=[t.label for t in market.tags],
+                platform=market.platform.value,
+                end_date=market.end_date,
+            )
+            report: AgentAReport = agent_a_initial(package, params)
+            agent_a_reports[market.market_id] = report.model_dump()
         except Exception as e:
             logger.error("Agent A failed for %s: %s", market.market_id, e)
             agent_a_reports[market.market_id] = {
@@ -251,6 +260,10 @@ def run_revision(state: MultiAgentState) -> dict:
     3. Repeat up to MAX_REVISION_ITERATIONS total
     """
     revision_model = state.get("revision_model", "claude-haiku-4-5-20251001")
+    agent_a_params = AgentAParams(
+        model_name=state.get("primary_model", "claude-haiku-4-5-20251001"),
+        cache_enabled=False,  # Don't cache revision outputs — they differ from initial
+    )
     agent_b_params = AgentBParams()
     now = datetime.now(timezone.utc)
     revision_outputs: dict[str, dict] = {}
@@ -261,25 +274,67 @@ def run_revision(state: MultiAgentState) -> dict:
         b_report = state["agent_b_reports"].get(mid, {})
 
         iterations = 0
+        current_a_report = a_report
         current_b_report = b_report
 
         while iterations < MAX_REVISION_ITERATIONS:
             rev_out: RevisionAgentOutput = revision_agent(
-                a_report, current_b_report, model=revision_model
+                current_a_report, current_b_report, model=revision_model
             )
             iterations += 1
             rev_out.iterations_used = iterations
 
-            # Route feedback to Agent B if applicable and iterations remain
+            a_feedback = [f for f in rev_out.feedback_to_send if f.recipient == "A"]
             b_feedback = [f for f in rev_out.feedback_to_send if f.recipient == "B"]
-            if b_feedback and iterations < MAX_REVISION_ITERATIONS:
+
+            if not (a_feedback or b_feedback) or iterations >= MAX_REVISION_ITERATIONS:
+                break
+
+            # Route feedback to Agent A
+            if a_feedback:
+                a_package = AgentAInputPackage(
+                    market_id=market.market_id,
+                    question=market.question,
+                    description=market.description or "",
+                    category=market.category or "",
+                    tags=[t.label for t in market.tags],
+                    platform=market.platform.value,
+                    end_date=market.end_date,
+                )
+                try:
+                    original_a = AgentAReport(**current_a_report)
+                    a_revision = agent_a_revise(
+                        original_report=original_a,
+                        revision_feedback=a_feedback[0].message,
+                        package=a_package,
+                        params=agent_a_params,
+                    )
+                    current_a_report = {
+                        **current_a_report,
+                        "insider_risk_score": a_revision.updated_insider_risk_score,
+                        "confidence": a_revision.updated_confidence,
+                        "reasoning": a_revision.final_reasoning,
+                        "info_holders": a_revision.updated_info_holders,
+                        "leak_vectors": a_revision.updated_leak_vectors,
+                    }
+                    logger.debug(
+                        "Revision loop %d/%d for %s (A): finding_changed=%s new_score=%d",
+                        iterations, MAX_REVISION_ITERATIONS, mid,
+                        a_revision.finding_changed,
+                        a_revision.updated_insider_risk_score,
+                    )
+                except Exception as e:
+                    logger.error("Agent A revision failed for %s: %s", mid, e)
+
+            # Route feedback to Agent B
+            if b_feedback:
                 price_history = []
                 if hasattr(market, "price_history") and market.price_history:
                     ph = market.price_history
                     price_history = ph.data_points if hasattr(ph, "data_points") else []
 
                 end_date = market.end_date or now
-                package = AgentBInputPackage(
+                b_package = AgentBInputPackage(
                     evaluation_date=now,
                     end_date=end_date,
                     price_history=price_history,
@@ -292,16 +347,14 @@ def run_revision(state: MultiAgentState) -> dict:
                         if market.start_date else None
                     ),
                 )
-
                 try:
                     original_b = AgentBReport(**current_b_report)
                     b_revision = agent_b_revise(
                         original_report=original_b,
                         revision_feedback=b_feedback[0].message,
-                        package=package,
+                        package=b_package,
                         params=agent_b_params,
                     )
-                    # Merge updated fields back
                     current_b_report = {
                         **current_b_report,
                         "signal_direction": b_revision.updated_signal_direction,
@@ -311,7 +364,7 @@ def run_revision(state: MultiAgentState) -> dict:
                         "context_for_other_agents": b_revision.context_for_other_agents,
                     }
                     logger.debug(
-                        "Revision loop %d/%d for %s: finding_changed=%s new_score=%d",
+                        "Revision loop %d/%d for %s (B): finding_changed=%s new_score=%d",
                         iterations, MAX_REVISION_ITERATIONS, mid,
                         b_revision.finding_changed,
                         b_revision.updated_behavior_score,
@@ -319,9 +372,8 @@ def run_revision(state: MultiAgentState) -> dict:
                 except Exception as e:
                     logger.error("Agent B revision failed for %s: %s", mid, e)
                     break
-            else:
-                break  # No feedback needed or max iterations reached
 
+        rev_out.agent_a_report = current_a_report
         rev_out.agent_b_report = current_b_report
         revision_outputs[mid] = rev_out.model_dump()
 
