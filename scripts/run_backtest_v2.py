@@ -2,7 +2,7 @@
 Backtesting pipeline v2 — full A → B → Revision → Decision chain.
 
 Stages:
-  1. Load markets from CSV
+  1. Load markets from parquet
   2. Filter to markets with sufficient price data in SQLite [end_date-72h, end_date-24h]
   3. Run Agent A (LLM, cached in data/backtest/agent_a.jsonl)
   4. Run Agent B (LLM, cached in data/backtest/agent_b.jsonl)
@@ -66,8 +66,8 @@ REV_LOOPS_CSV    = BACKTEST_DIR / "revision_loops.csv"
 RESULTS_DIR      = BACKTEST_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH  = DATA_DIR / "price_history.db"
-CSV_PATH = EXPORTS_DIR / "polymarket_tagged_sample.csv"
+DB_PATH      = DATA_DIR / "price_history.db"
+PARQUET_PATH = EXPORTS_DIR / "polymarket_tagged_sample.parquet"
 
 MAX_REVISION_ITERATIONS = 2  # match graph.py
 
@@ -171,15 +171,15 @@ def log_revision_loop(market_id: str, question: str, rev_out: dict) -> None:
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-def load_markets(csv_path: Path, limit: int | None = None) -> list[dict]:
-    """Load markets from CSV, filtering to closed polymarket markets with outcomes."""
-    df = pd.read_csv(csv_path, low_memory=False)
+def load_markets(parquet_path: Path, limit: int | None = None) -> list[dict]:
+    """Load markets from parquet, filtering to closed polymarket markets with outcomes."""
+    df = pd.read_parquet(parquet_path)
     df = df[df["platform"] == "polymarket"].copy()
     df = df[df["resolved_yes"].notna()].copy()
     markets = df.to_dict(orient="records")
     if limit:
         markets = markets[:limit]
-    logger.info("Loaded %d resolved polymarket markets from CSV", len(markets))
+    logger.info("Loaded %d resolved polymarket markets from parquet", len(markets))
     return markets
 
 
@@ -793,8 +793,8 @@ def parse_args() -> argparse.Namespace:
                    help="Also run LLM-based decision for GO_EVALUATE markets")
     p.add_argument("--workers",        type=int, default=20,
                    help="ThreadPoolExecutor workers per LLM stage (default 20)")
-    p.add_argument("--csv",            type=Path, default=CSV_PATH,
-                   help=f"Markets CSV path (default: {CSV_PATH})")
+    p.add_argument("--parquet",        type=Path, default=PARQUET_PATH,
+                   help=f"Markets parquet path (default: {PARQUET_PATH})")
     p.add_argument("--db",             type=Path, default=DB_PATH,
                    help=f"SQLite price history path (default: {DB_PATH})")
     return p.parse_args()
@@ -806,7 +806,7 @@ def main() -> None:
 
     # ── Stage 1: Load markets ─────────────────────────────────────────────────
     logger.info("Stage 1: Loading markets")
-    all_markets = load_markets(args.csv, limit=args.limit)
+    all_markets = load_markets(args.parquet, limit=args.limit)
     total_in_csv = len(all_markets)
 
     # ── Stage 2: Filter to markets with price data ────────────────────────────
