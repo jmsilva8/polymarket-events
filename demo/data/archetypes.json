@@ -1,0 +1,122 @@
+{
+  "crypto_price": {
+    "score": 1,
+    "reasoning": "Public market, no insider determines outcome",
+    "info_holders": [],
+    "patterns": ["bitcoin", "ethereum", "crypto", "btc", "eth", "solana", "sol price", "token price", "coin price", "doge"]
+  },
+  "weather_event": {
+    "score": 1,
+    "reasoning": "Natural process, no human insider knowledge",
+    "info_holders": [],
+    "patterns": ["temperature", "weather", "hurricane", "earthquake", "tornado", "rainfall", "snowfall", "heat wave"]
+  },
+  "election_outcome": {
+    "score": 2,
+    "reasoning": "Determined by millions of voters in real-time, publicly polled",
+    "info_holders": ["pollsters"],
+    "patterns": ["election winner", "presidential election", "will win the election", "electoral college", "primary winner", "nominee"]
+  },
+  "sports_game_winner": {
+    "score": 3,
+    "reasoning": "Determined on the field/court in real-time; minor insider edge from injuries and lineups",
+    "info_holders": ["team staff", "medical staff"],
+    "patterns": ["game winner", "championship winner", "super bowl winner", "nba champion", "world series", "premier league winner", "champions league winner", "playoff", "match winner"]
+  },
+  "sports_mvp_award": {
+    "score": 4,
+    "reasoning": "Voted by media/panel before announcement, but based on public performance; some voter preferences may leak",
+    "info_holders": ["media voters", "league officials"],
+    "patterns": ["mvp", "most valuable player", "player of the year", "rookie of the year", "defensive player"]
+  },
+  "award_show_winner": {
+    "score": 5,
+    "reasoning": "Winners chosen by voters/academy weeks before ceremony; accounting firms know; envelopes prepared in advance",
+    "info_holders": ["academy voters", "accounting firm (PwC/Deloitte)", "ceremony producers"],
+    "patterns": ["oscar", "academy award", "best picture", "best actor", "best actress", "best director", "grammy", "emmy", "golden globe", "award winner", "tony award", "bafta"]
+  },
+  "box_office_performance": {
+    "score": 4,
+    "reasoning": "Opening weekend estimates circulate among industry insiders; tracking services have early data",
+    "info_holders": ["studio executives", "theater chains", "tracking services"],
+    "patterns": ["box office", "highest grossing", "opening weekend", "domestic gross"]
+  },
+  "music_chart_position": {
+    "score": 5,
+    "reasoning": "Streaming and sales data is tracked in real-time by industry; chart positions known hours before official release",
+    "info_holders": ["label executives", "streaming platform staff", "Billboard/chart compilers"],
+    "patterns": ["billboard", "number one song", "top album", "chart", "spotify top", "number 1 album", "streaming record"]
+  },
+  "reality_tv_elimination": {
+    "score": 8,
+    "reasoning": "Episodes are pre-recorded; cast, crew, and producers know outcomes weeks/months before broadcast",
+    "info_holders": ["show producers", "cast members", "editing team", "network executives"],
+    "patterns": ["eliminated", "voted off", "bachelor", "bachelorette", "survivor", "big brother", "american idol", "the voice", "dancing with the stars", "reality show"]
+  },
+  "tv_show_plot_outcome": {
+    "score": 7,
+    "reasoning": "Writers, actors, and production crew know plot outcomes before episodes air",
+    "info_holders": ["writers", "actors", "directors", "production crew", "network executives"],
+    "patterns": ["season finale", "character dies", "who will", "show ending", "next episode", "series finale"]
+  },
+  "product_launch": {
+    "score": 7,
+    "reasoning": "Company employees and partners know features/dates weeks or months before public announcement",
+    "info_holders": ["company employees", "supply chain partners", "investors"],
+    "patterns": ["product launch", "release date", "iphone", "new model", "announce", "unveil"]
+  },
+  "halftime_show": {
+    "score": 8,
+    "reasoning": "Performers, crew, producers, and NFL all know the setlist and guests; large information chain with many people involved",
+    "info_holders": ["performers", "backup dancers", "stage crew", "producers", "NFL officials", "rehearsal attendees"],
+    "patterns": ["halftime", "halftime show", "perform at", "setlist", "first song", "super bowl performance", "halftime performer"]
+  },
+  "super_bowl_ads": {
+    "score": 9,
+    "reasoning": "Ad buyers, agencies, and network sales teams all know which ads will air well in advance; contracts signed months ahead",
+    "info_holders": ["ad agencies", "brand marketing teams", "network ad sales", "production companies"],
+    "patterns": ["super bowl ad", "super bowl commercial", "commercial during", "advertise during"]
+  },
+  "regulatory_ruling": {
+    "score": 9,
+    "reasoning": "Regulators, their staff, and sometimes lobbied parties know rulings before public announcement; massive financial incentive",
+    "info_holders": ["regulators", "legal counsel", "lobbying firms", "affected companies"],
+    "patterns": ["fda approval", "regulatory ruling", "sec ruling", "antitrust", "court ruling", "verdict"]
+  },
+  "corporate_earnings": {
+    "score": 6,
+    "reasoning": "Company insiders know financial results before earnings calls; SEC regulations exist but leaks happen",
+    "info_holders": ["CFO", "accounting team", "auditors", "board members"],
+    "patterns": ["earnings", "revenue", "quarterly results", "eps", "profit", "beat estimates"]
+  },
+  "person_of_year": {
+    "score": 6,
+    "reasoning": "Editorial board decides weeks before announcement; small group of journalists and editors know",
+    "info_holders": ["editorial board", "magazine staff", "cover photographers"],
+    "patterns": ["person of the year", "time person", "man of the year", "woman of the year"]
+  },
+  "netflix_ranking": {
+    "score": 5,
+    "reasoning": "Netflix internal teams have real-time viewership data; rankings known before weekly public release",
+    "info_holders": ["Netflix analytics team", "content executives", "show producers"],
+    "patterns": ["netflix number 1", "netflix top", "most watched on netflix", "netflix ranking", "netflix global"]
+  },
+  "rotten_tomatoes_score": {
+    "score": 4,
+    "reasoning": "Critics and aggregation staff see scores accumulate before public release; early screenings inform predictions",
+    "info_holders": ["film critics", "RT aggregation staff", "studio PR teams"],
+    "patterns": ["rotten tomatoes", "tomatometer", "critic score", "rt score", "fresh or rotten"]
+  },
+  "tiktok_ban": {
+    "score": 6,
+    "reasoning": "Government officials and their staff know regulatory decisions before public announcement; legal teams involved",
+    "info_holders": ["government officials", "congressional staff", "DOJ lawyers", "ByteDance executives"],
+    "patterns": ["tiktok ban", "tiktok banned", "tiktok removed"]
+  },
+  "eurovision": {
+    "score": 4,
+    "reasoning": "Live voting event, but jury votes (50% of score) are cast before broadcast; rehearsal performances seen by jury and press",
+    "info_holders": ["national juries", "press attendees", "rehearsal audience", "production crew"],
+    "patterns": ["eurovision", "eurovision winner", "eurovision song contest"]
+  }
+}
