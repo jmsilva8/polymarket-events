@@ -7,7 +7,11 @@ __pycache__/
 # Environment / secrets
 .env
 
-# Data (cached API responses, exports, reports)
+# Data (cached API responses, exports, reports, backtest results)
 data/cache/
 data/exports/
+data/backtest/
 reports/
+
+# Databases
+*.db
