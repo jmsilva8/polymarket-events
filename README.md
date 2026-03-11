@@ -94,16 +94,18 @@ The backtesting framework evaluates historical Polymarket markets against a para
 - The price crosses a configured threshold within a defined window before resolution
 - Optional: an abnormal price move is also detected
 
-Backtested configurations varied across several dimensions:
+Six decision configurations were evaluated, each re-run against the same fixed Agent A / B / Revision outputs:
 
-| Config type | Description |
+| Config | Description |
 |---|---|
-| **LLM Decision** | Decision Agent uses LLM reasoning instead of deterministic formula |
-| **Balanced** | Equal weighting across Agent A, B, and revision signals |
-| **Agent A-weighted** | Insider risk text score drives the decision |
-| **Agent B-weighted** | Quantitative price signals drive the decision |
+| `default` | Balanced defaults (A: 0.4, B: 0.3, revision boost: 0.3) |
+| `aggressive` | Lower GO thresholds to generate more signals |
+| `conservative` | Higher thresholds — only acts on strong signals |
+| `a_heavy` | More weight on Agent A (insider risk text score) |
+| `b_heavy` | More weight on Agent B (quantitative price signals) |
+| `no_conf_penalty` | Ignores confidence levels when scoring |
 
-Additional sweep dimensions: price thresholds (0.55–0.80), signal windows (6–72h before close), and minimum price jump filters.
+An optional seventh config (`llm`) uses LLM reasoning for the final decision instead of the deterministic formula, enabled via `--llm-decision`.
 
 ---
 
