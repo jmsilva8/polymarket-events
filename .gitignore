@@ -15,3 +15,8 @@ reports/
 
 # Databases
 *.db
+
+# Demo dataset — self-contained 100-market subset (committed intentionally)
+!demo/data/exports/
+!demo/data/backtest/
+!demo/data/price_history.db
