@@ -199,15 +199,19 @@ polymarket-events/
 │   │   ├── decision_agent/    # GO/SKIP decision with edge estimation
 │   │   └── revision_agent.py  # Cross-validation and feedback loop
 │   ├── data_layer/            # API clients, caching, data models
-│   ├── backtest_engine/       # Strategy, parameter sweep, metrics
 │   ├── graph.py               # LangGraph multi-agent orchestration
 │   └── config.py
 ├── scripts/
 │   ├── run_classification.py  # Live classification pipeline
 │   ├── run_backtest_v2.py     # Backtesting pipeline
 │   └── build_demo_dataset.py  # Builds self-contained demo dataset
-├── demo/data/                 # Pre-built demo dataset (committed)
-├── data/                      # Local cache, exports, backtest results
+├── demo/
+│   └── data/
+│       ├── exports/           # polymarket_tagged_sample.parquet
+│       ├── backtest/          # Agent JSONL outputs + results CSVs
+│       ├── price_history.db   # SQLite price snapshots
+│       └── archetypes.json    # Market archetype definitions
+├── data/                      # Local cache, exports, backtest results (gitignored)
 ├── tests/
 └── INSIDER_ALPHA_FINAL.ipynb  # Interactive demo notebook
 ```
