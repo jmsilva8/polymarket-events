@@ -1,8 +1,23 @@
 """
 build_demo_dataset.py
 
-Creates a self-contained demo dataset with 100 markets so the notebook
-can run end-to-end without querying Polymarket.
+Creates a self-contained demo dataset with 100 **real** markets so the
+notebook can run end-to-end without querying Polymarket or making LLM calls.
+
+All data is sourced from the full cached pipeline outputs:
+  - data/exports/polymarket_tagged_sample.parquet  (real market metadata)
+  - data/price_history.db                          (real CLOB price history)
+  - data/backtest/agent_a.jsonl                    (real LLM classification)
+  - data/backtest/agent_b.jsonl                    (real LLM analysis)
+  - data/backtest/revision.jsonl                   (real revision results)
+
+Selection strategy:
+  - 100 markets chosen for maximum signal diversity (A-high/B-high,
+    A-high/B-low, A-low/B-high, both-medium, both-low, etc.)
+  - Preference for recognizable, fun, or memeable markets
+  - No duplication of nearly-identical markets (e.g. only one Iran strike
+    market, one Fed meeting, etc.)
+  - Always includes market 523151 (GPT-4.5 release — notebook default)
 
 Outputs (relative to project root):
   demo/data/exports/polymarket_tagged_sample.parquet
@@ -13,24 +28,19 @@ Outputs (relative to project root):
 """
 
 import json
-import random
 import sqlite3
-import math
-from datetime import datetime, timezone, timedelta
+import shutil
 from pathlib import Path
 
-import pandas as pd
-import numpy as np
-
-random.seed(42)
-np.random.seed(42)
+import pyarrow.parquet as pq
+import pyarrow as pa
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "data" / "backtest"
+DATA = ROOT / "data"
 DEMO = ROOT / "demo" / "data"
 
 # ---------------------------------------------------------------------------
-# 1. Load all cached LLM results
+# 1. Load all cached data
 # ---------------------------------------------------------------------------
 
 def load_jsonl(path):
@@ -41,230 +51,265 @@ def load_jsonl(path):
             records[str(d["market_id"])] = d
     return records
 
-print("Loading jsonl files...")
-a_all = load_jsonl(DATA / "agent_a.jsonl")
-b_all = load_jsonl(DATA / "agent_b.jsonl")
-r_all = load_jsonl(DATA / "revision.jsonl")
+print("Loading source data...")
+a_all = load_jsonl(DATA / "backtest" / "agent_a.jsonl")
+b_all = load_jsonl(DATA / "backtest" / "agent_b.jsonl")
+r_all = load_jsonl(DATA / "backtest" / "revision.jsonl")
 
-all_ids = sorted(set(a_all) & set(b_all) & set(r_all))
-print(f"  {len(all_ids)} markets in all three files")
+# Real market metadata from parquet
+table = pq.read_table(DATA / "exports" / "polymarket_tagged_sample.parquet")
+parquet_by_id = {}
+for i in range(len(table)):
+    mid = str(table.column("market_id")[i].as_py())
+    parquet_by_id[mid] = {col: table.column(col)[i].as_py() for col in table.column_names}
+
+# Markets present in ALL sources
+all_agent_ids = set(a_all) & set(b_all) & set(r_all)
+eligible = all_agent_ids & set(parquet_by_id)
+
+# Real price history — check which markets have enough data points
+conn_src = sqlite3.connect(DATA / "price_history.db")
+cur = conn_src.cursor()
+cur.execute("SELECT market_id, COUNT(*) FROM price_history GROUP BY market_id")
+price_counts = {str(r[0]): r[1] for r in cur.fetchall()}
+
+# Require at least 10 price points for meaningful demo
+eligible = {mid for mid in eligible if price_counts.get(mid, 0) >= 10}
+print(f"  {len(eligible)} markets eligible (all sources + >=10 price points)")
 
 # ---------------------------------------------------------------------------
-# 2. Select 100 diverse markets
-#    - Always include market 523151 (the one hardcoded in the notebook)
-#    - Stratify by insider_risk_score (low/mid/high) for diversity
+# 2. Build a scored index for smart selection
 # ---------------------------------------------------------------------------
 
-PINNED = "523151"
+market_index = []
+for mid in eligible:
+    a = a_all[mid]
+    b = b_all[mid]
+    r = r_all[mid]
+    p = parquet_by_id[mid]
 
-scored = []
-for mid in all_ids:
-    score = a_all[mid].get("insider_risk_score", 5)
-    signal = b_all[mid].get("signal_direction", "SKIP")
-    behavior = b_all[mid].get("behavior_score", 1)
-    flag = r_all[mid].get("revision_flag", "NONE")
-    scored.append((mid, score, signal, behavior, flag))
+    a_score = a.get("insider_risk_score", 0)
+    b_score = b.get("behavior_score", 0)
+    b_dir = b.get("signal_direction", "SKIP")
+    rev_flag = r.get("revision_flag", "NONE")
+    rev_rec = r.get("recommendation_to_decision_agent", "GO_EVALUATE")
+    title = a.get("market_title", "")
+    volume = float(p.get("volume", 0) or 0)
 
-# Sort by score for stratified sampling
-scored.sort(key=lambda x: x[1])
+    # Classify signal profile
+    a_level = "high" if a_score >= 7 else ("med" if a_score >= 4 else "low")
+    b_level = "high" if b_score >= 7 else ("med" if b_score >= 4 else "low")
+    profile = f"{a_level}_{b_level}"
 
-low   = [x for x in scored if x[1] <= 3]
-mid   = [x for x in scored if 4 <= x[1] <= 6]
-high  = [x for x in scored if x[1] >= 7]
+    market_index.append({
+        "mid": mid, "title": title, "volume": volume,
+        "a_score": a_score, "b_score": b_score, "b_dir": b_dir,
+        "rev_flag": rev_flag, "rev_rec": rev_rec, "profile": profile,
+        "price_points": price_counts.get(mid, 0),
+    })
 
-def pick(group, n):
-    step = max(1, len(group) // n)
-    return [group[i][0] for i in range(0, min(len(group), n * step), step)][:n]
+# ---------------------------------------------------------------------------
+# 3. Hand-curated selection for maximum diversity and interest
+#
+# Target allocation across signal profiles:
+#   a_high_b_high  (DIRECTIONAL_CONFLICT):  ~12  - the "hot" markets
+#   a_high_b_low   (PRE_SIGNAL / WATCH):    ~12  - insider risk but no move yet
+#   a_low_b_high   (PUBLIC_INFO_ADJUSTED):   ~12  - price moved but public info
+#   a_med_b_high:                            ~14  - moderate insider + strong signal
+#   a_high_b_med:                            ~6   - rare profile
+#   a_med_b_med:                             ~10  - balanced / uncertain
+#   a_low_b_low:                             ~12  - quiet / no signal
+#   a_med_b_low:                             ~14  - typical markets
+#   a_low_b_med:                             ~8   - low risk but some movement
+#
+# Within each bucket we prefer:
+#   1. Higher volume (more recognizable)
+#   2. More price data points
+#   3. Diverse topics (avoid 10 Iran markets)
+# ---------------------------------------------------------------------------
+
+PINNED = "523151"  # GPT-4.5 release — always included
+
+# Target counts per profile
+TARGETS = {
+    "high_high": 12,
+    "high_low":  12,
+    "low_high":  12,
+    "med_high":  14,
+    "high_med":  6,
+    "med_med":   10,
+    "low_low":   12,
+    "med_low":   14,
+    "low_med":   8,
+}
+
+# Group markets by profile
+by_profile = {}
+for m in market_index:
+    by_profile.setdefault(m["profile"], []).append(m)
+
+# Sort each bucket: prefer higher volume, then more price points
+for profile in by_profile:
+    by_profile[profile].sort(key=lambda x: (-x["volume"], -x["price_points"]))
+
+
+def deduplicate_topics(markets, max_per_topic=2):
+    """
+    Avoid picking too many near-identical markets (e.g. 5 Iran strike markets).
+    Uses simple keyword clustering.
+    """
+    topic_keys = [
+        "iran", "israel", "fed rate", "fed interest", "fed decrease", "fed increase",
+        "fed emergency", "elon tweet", "trump tweet", "tiktok",
+        "oscar", "grammy", "emmy", "eurovision", "box office",
+        "olympics", "hurricane", "recession", "bitcoin", "ethereum",
+        "openai", "gpt-5", "gpt-4", "taylor swift", "north korea",
+        "ukraine", "russia", "china", "apple", "nvidia", "tesla",
+        "spacex", "netflix", "drone", "bird flu", "pandemic",
+    ]
+    topic_counts = {}
+    result = []
+    for m in markets:
+        title_lower = m["title"].lower()
+        # Find which topic cluster this market belongs to
+        matched_topic = None
+        for tk in topic_keys:
+            if tk in title_lower:
+                matched_topic = tk
+                break
+        if matched_topic:
+            count = topic_counts.get(matched_topic, 0)
+            if count >= max_per_topic:
+                continue
+            topic_counts[matched_topic] = count + 1
+        result.append(m)
+    return result
+
 
 selected_ids = set()
-selected_ids.update(pick(low,  33))
-selected_ids.update(pick(mid,  34))
-selected_ids.update(pick(high, 33))
-selected_ids.add(PINNED)
+
+# Always include pinned market
+if PINNED in eligible:
+    selected_ids.add(PINNED)
+
+# Fill each profile bucket
+for profile, target in TARGETS.items():
+    pool = by_profile.get(profile, [])
+    pool = deduplicate_topics(pool)
+    # Skip already-selected
+    pool = [m for m in pool if m["mid"] not in selected_ids]
+    for m in pool[:target]:
+        selected_ids.add(m["mid"])
+
+# If we're short of 100, fill from the largest remaining markets
+if len(selected_ids) < 100:
+    remaining = [m for m in market_index if m["mid"] not in selected_ids]
+    remaining = deduplicate_topics(remaining)
+    remaining.sort(key=lambda x: (-x["volume"], -x["price_points"]))
+    for m in remaining:
+        if len(selected_ids) >= 100:
+            break
+        selected_ids.add(m["mid"])
+
+# If we have more than 100 (unlikely), trim
 selected_ids = list(selected_ids)[:100]
 
-# Make sure PINNED is always included
-if PINNED not in selected_ids:
-    selected_ids[0] = PINNED
+# Verify pinned is still there
+assert PINNED in selected_ids, f"Pinned market {PINNED} was lost during selection"
 
 print(f"  Selected {len(selected_ids)} markets (including pinned {PINNED})")
 
-# ---------------------------------------------------------------------------
-# 3. Build parquet — synthesize the columns the notebook needs
-# ---------------------------------------------------------------------------
-
-CATEGORY_HINTS = {
-    "oscar":     "Entertainment",
-    "academy":   "Entertainment",
-    "grammy":    "Entertainment",
-    "emmy":      "Entertainment",
-    "billboard": "Entertainment",
-    "box office": "Entertainment",
-    "film":      "Entertainment",
-    "movie":     "Entertainment",
-    "album":     "Entertainment",
-    "artist":    "Entertainment",
-    "song":      "Entertainment",
-    "fed":       "Finance",
-    "rate":      "Finance",
-    "inflation": "Finance",
-    "gdp":       "Finance",
-    "recession": "Finance",
-    "stock":     "Finance",
-    "market":    "Finance",
-    "s&p":       "Finance",
-    "tech":      "Technology",
-    "ai":        "Technology",
-    "openai":    "Technology",
-    "apple":     "Technology",
-    "google":    "Technology",
-    "microsoft": "Technology",
-    "elon":      "Technology",
-    "twitter":   "Technology",
-    "world cup": "Sports",
-    "super bowl": "Sports",
-    "nba":       "Sports",
-    "nfl":       "Sports",
-    "mlb":       "Sports",
-    "bitcoin":   "Crypto",
-    "ethereum":  "Crypto",
-    "crypto":    "Crypto",
-    "election":  "Elections",
-    "president": "Politics",
-    "senate":    "Politics",
-    "congress":  "Politics",
-    "ukraine":   "Geopolitics",
-    "russia":    "Geopolitics",
-    "china":     "Geopolitics",
-    "taiwan":    "Geopolitics",
-    "nato":      "Geopolitics",
-    "climate":   "Environment",
-    "covid":     "Health",
-    "vaccine":   "Health",
-    "fda":       "Health",
-}
-
-def infer_category(title: str) -> str:
-    t = title.lower()
-    for keyword, cat in CATEGORY_HINTS.items():
-        if keyword in t:
-            return cat
-    return "Other"
-
-
-rows = []
+# Print distribution summary
+profile_counts = {}
 for mid in selected_ids:
-    rec_a = a_all[mid]
-    rec_b = b_all[mid]
+    a_score = a_all[mid].get("insider_risk_score", 0)
+    b_score = b_all[mid].get("behavior_score", 0)
+    a_level = "high" if a_score >= 7 else ("med" if a_score >= 4 else "low")
+    b_level = "high" if b_score >= 7 else ("med" if b_score >= 4 else "low")
+    profile = f"A-{a_level}_B-{b_level}"
+    profile_counts[profile] = profile_counts.get(profile, 0) + 1
 
-    title = rec_a.get("market_title", f"Market {mid}")
-    category = infer_category(title)
+print("\n  Signal profile distribution:")
+for p in sorted(profile_counts):
+    print(f"    {p}: {profile_counts[p]}")
 
-    # Derive end_date from agent_b evaluation_date (+24h)
-    eval_iso = rec_b.get("evaluation_date", "2024-06-01T00:00:00+00:00")
-    eval_dt  = datetime.fromisoformat(eval_iso)
-    end_dt   = eval_dt + timedelta(hours=24)
-    start_dt = end_dt - timedelta(days=random.randint(30, 180))
+# Revision flag distribution
+flag_counts = {}
+for mid in selected_ids:
+    flag = r_all[mid].get("revision_flag", "NONE")
+    flag_counts[flag] = flag_counts.get(flag, 0) + 1
+print("\n  Revision flag distribution:")
+for f in sorted(flag_counts):
+    print(f"    {f}: {flag_counts[f]}")
 
-    # Synthetic but plausible volume
-    risk_score = rec_a.get("insider_risk_score", 5)
-    behavior   = rec_b.get("behavior_score", 1)
-    volume = random.randint(25_000, 2_000_000)
+# ---------------------------------------------------------------------------
+# 4. Build parquet from REAL market metadata
+# ---------------------------------------------------------------------------
 
-    # yes_price: last price in backtest window (or synthetic)
-    yes_price = round(random.uniform(0.15, 0.90), 3)
+print("\nBuilding demo parquet...")
+columns = table.column_names
+demo_rows = {col: [] for col in columns}
 
-    tags = "|".join(rec_a.get("info_holders", [])[:3])
+for mid in selected_ids:
+    row = parquet_by_id[mid]
+    for col in columns:
+        demo_rows[col].append(row[col])
 
-    rows.append({
-        "market_id":  mid,
-        "question":   title,
-        "category":   category,
-        "status":     "closed",
-        "volume":     float(volume),
-        "yes_price":  yes_price,
-        "end_date":   end_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-        "start_date": start_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
-        "tags":       tags,
-        "platform":   "polymarket",
-    })
+demo_table = pa.table(demo_rows, schema=table.schema)
 
-df = pd.DataFrame(rows)
-
-# Save parquet
 exports_dir = DEMO / "exports"
 exports_dir.mkdir(parents=True, exist_ok=True)
 parquet_path = exports_dir / "polymarket_tagged_sample.parquet"
-df.to_parquet(parquet_path, index=False)
-print(f"  Wrote parquet: {parquet_path} ({len(df)} rows)")
+pq.write_table(demo_table, parquet_path)
+print(f"  Wrote parquet: {parquet_path} ({len(selected_ids)} rows)")
 
 # ---------------------------------------------------------------------------
-# 4. Build price_history.db — synthetic realistic price series
+# 5. Build price_history.db from REAL price data
 # ---------------------------------------------------------------------------
 
-def generate_price_series(end_dt: datetime, n_points: int = 60,
-                          start_price: float = 0.5,
-                          outcome: float = None) -> list[tuple]:
-    """
-    Generate a realistic binary prediction market price series.
-    Prices evolve as a bounded random walk and converge toward outcome near end.
-    Returns list of (unix_timestamp, price).
-    """
-    window_hours = 120 + 24  # 5 days before end + 24h buffer
-    start_ts = end_dt - timedelta(hours=window_hours)
-
-    if outcome is None:
-        outcome = float(random.choice([0.05, 0.95]))  # markets resolve to YES or NO
-
-    prices = []
-    price = start_price
-    for i in range(n_points):
-        frac = i / n_points
-        # Drift toward outcome as market approaches resolution
-        drift = (outcome - price) * (frac ** 2) * 0.4
-        noise = np.random.normal(0, 0.015) * (1 - frac * 0.5)
-        price = float(np.clip(price + drift + noise, 0.01, 0.99))
-        ts = start_ts + timedelta(hours=window_hours * i / n_points)
-        prices.append((int(ts.timestamp()), round(price, 4)))
-
-    return prices
-
-
+print("Building demo price_history.db...")
 db_path = DEMO / "price_history.db"
 db_path.parent.mkdir(parents=True, exist_ok=True)
 
-conn = sqlite3.connect(db_path)
-conn.execute("""
-    CREATE TABLE IF NOT EXISTS price_history (
+conn_dst = sqlite3.connect(db_path)
+conn_dst.execute("DROP TABLE IF EXISTS price_history")
+conn_dst.execute("""
+    CREATE TABLE price_history (
         market_id TEXT,
         timestamp INTEGER,
         price     REAL
     )
 """)
-conn.execute("CREATE INDEX IF NOT EXISTS idx_market ON price_history(market_id)")
-conn.execute("DELETE FROM price_history")
 
-price_rows = []
-for row in rows:
-    mid     = str(row["market_id"])
-    end_dt  = datetime.fromisoformat(row["end_date"])
-    s_price = row["yes_price"]
-    outcome = random.choice([0.04, 0.96])
-    series  = generate_price_series(end_dt, n_points=60,
-                                    start_price=s_price, outcome=outcome)
-    for ts, price in series:
-        price_rows.append((mid, ts, price))
+total_price_rows = 0
+for mid in selected_ids:
+    cur.execute(
+        "SELECT market_id, timestamp, price FROM price_history WHERE market_id = ?",
+        (mid,)
+    )
+    rows = cur.fetchall()
+    if not rows:
+        # Try numeric form
+        cur.execute(
+            "SELECT market_id, timestamp, price FROM price_history WHERE market_id = ?",
+            (int(mid),)
+        )
+        rows = cur.fetchall()
+    conn_dst.executemany("INSERT INTO price_history VALUES (?, ?, ?)", rows)
+    total_price_rows += len(rows)
 
-conn.executemany("INSERT INTO price_history VALUES (?, ?, ?)", price_rows)
-conn.commit()
-conn.close()
+conn_dst.execute("CREATE INDEX idx_market ON price_history(market_id)")
+conn_dst.commit()
+conn_dst.close()
+conn_src.close()
 
-print(f"  Wrote price_history.db: {db_path} ({len(price_rows)} price points)")
+print(f"  Wrote price_history.db: {db_path} ({total_price_rows} price points)")
 
 # ---------------------------------------------------------------------------
-# 5. Write trimmed jsonl files
+# 6. Write trimmed JSONL files (real LLM results)
 # ---------------------------------------------------------------------------
 
+print("Writing demo JSONL files...")
 backtest_dir = DEMO / "backtest"
 backtest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -276,25 +321,51 @@ for name, source in [("agent_a", a_all), ("agent_b", b_all), ("revision", r_all)
     print(f"  Wrote {out_path} ({len(selected_ids)} records)")
 
 # ---------------------------------------------------------------------------
-# 6. Copy archetypes.json
+# 7. Copy archetypes.json
 # ---------------------------------------------------------------------------
-import shutil
-archetypes_src = ROOT / "data" / "archetypes.json"
+
+archetypes_src = DATA / "archetypes.json"
 archetypes_dst = DEMO / "archetypes.json"
-shutil.copy(archetypes_src, archetypes_dst)
-print(f"  Copied archetypes.json")
+if archetypes_src.exists():
+    shutil.copy(archetypes_src, archetypes_dst)
+    print("  Copied archetypes.json")
 
 # ---------------------------------------------------------------------------
-# 7. Copy backtest results CSVs (full — they're small and tell the story)
+# 8. Copy backtest results CSVs
 # ---------------------------------------------------------------------------
-results_src = ROOT / "data" / "backtest" / "results"
+
+results_src = DATA / "backtest" / "results"
 results_dst = DEMO / "backtest" / "results"
 results_dst.mkdir(parents=True, exist_ok=True)
+csv_count = 0
 for csv_file in results_src.glob("*.csv"):
     shutil.copy(csv_file, results_dst / csv_file.name)
-print(f"  Copied {len(list(results_src.glob('*.csv')))} result CSVs")
+    csv_count += 1
+print(f"  Copied {csv_count} result CSVs")
 
-print("\n✅ Demo dataset ready in demo/data/")
-print(f"   Markets: {len(selected_ids)}")
-print(f"   Parquet: {parquet_path.stat().st_size // 1024} KB")
-print(f"   DB:      {db_path.stat().st_size // 1024} KB")
+# ---------------------------------------------------------------------------
+# 9. Summary
+# ---------------------------------------------------------------------------
+
+print(f"\n{'='*60}")
+print(f"Demo dataset ready in demo/data/")
+print(f"  Markets:      {len(selected_ids)}")
+print(f"  Parquet:      {parquet_path.stat().st_size // 1024} KB")
+print(f"  Price DB:     {db_path.stat().st_size // 1024} KB ({total_price_rows} rows)")
+print(f"  Agent A JSONL: real LLM results")
+print(f"  Agent B JSONL: real LLM results")
+print(f"  Revision JSONL: real results")
+print(f"{'='*60}")
+
+# Print a few sample markets for verification
+print("\nSample markets:")
+for mid in list(selected_ids)[:10]:
+    a = a_all[mid]
+    b = b_all[mid]
+    r = r_all[mid]
+    title = a.get("market_title", "")[:70]
+    print(f"  [{mid}] A={a.get('insider_risk_score',0)} "
+          f"B={b.get('behavior_score',0)} "
+          f"dir={b.get('signal_direction','?')} "
+          f"rev={r.get('revision_flag','?')} "
+          f"| {title}")

@@ -163,13 +163,19 @@ The notebook walks through:
 
 ### Run the Classification Pipeline
 
-To classify markets using live data:
+To classify markets using live data, you first need to download market data from Polymarket/Kalshi:
+
+```bash
+python -c "from src.data_layer.download_sample import main; main()"
+```
+
+This populates `data/exports/` with the required market CSV/parquet files. Then run the pipeline:
 
 ```bash
 python scripts/run_classification.py
 ```
 
-This downloads markets from Polymarket and Kalshi, runs all agents, and exports results to `data/exports/`.
+This runs all agents on the downloaded markets and exports results to `data/exports/`.
 
 ### Run the Backtesting Pipeline
 
@@ -204,7 +210,9 @@ polymarket-events/
 ├── scripts/
 │   ├── run_classification.py  # Live classification pipeline
 │   ├── run_backtest_v2.py     # Backtesting pipeline
+│   ├── plot_backtest_v2.py    # Backtest visualization
 │   └── build_demo_dataset.py  # Builds self-contained demo dataset
+├── docs/                      # Agent design specs
 ├── demo/
 │   └── data/
 │       ├── exports/           # polymarket_tagged_sample.parquet

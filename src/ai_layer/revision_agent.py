@@ -39,6 +39,26 @@ class FeedbackMessage(BaseModel):
     message: str
 
 
+class _LLMRevisionResponse(BaseModel):
+    """Schema sent to the LLM — no dict fields (OpenAI structured output
+    requires additionalProperties:false on all objects)."""
+
+    revision_flag: Literal[
+        "NONE",
+        "PUBLIC_INFO_ADJUSTED",
+        "PRE_SIGNAL",
+        "REVERSION",
+        "INTERNAL_CONFLICT",
+        "DIRECTIONAL_CONFLICT",
+    ]
+    flag_explanation: str
+    revision_notes: str
+    feedback_to_send: list[FeedbackMessage] = []
+    recommendation_to_decision_agent: Literal["GO_EVALUATE", "SKIP", "WATCH"]
+    iterations_used: int = 0
+    llm_reasoning_summary: Optional[str] = None
+
+
 class RevisionAgentOutput(BaseModel):
     """Final output passed to Decision Agent."""
 
@@ -52,9 +72,9 @@ class RevisionAgentOutput(BaseModel):
     ]
     flag_explanation: str
 
-    # Pass-through for Decision Agent context — set after LLM call, excluded from schema
-    agent_a_report: dict = Field(default_factory=dict, exclude=True)
-    agent_b_report: dict = Field(default_factory=dict, exclude=True)
+    # Pass-through for Decision Agent context — not sent to LLM
+    agent_a_report: dict = Field(default_factory=dict)
+    agent_b_report: dict = Field(default_factory=dict)
 
     # Narrative combining coherence assessment + pattern evidence + feedback decisions
     revision_notes: str
@@ -305,18 +325,20 @@ def revision_agent(
     if llm is None:
         llm = init_chat_model(
             model, temperature=0, model_provider=_provider(model)
-        ).with_structured_output(RevisionAgentOutput)
+        ).with_structured_output(_LLMRevisionResponse)
 
     user_prompt = _build_user_prompt(agent_a_report, agent_b_report)
 
     try:
-        result: RevisionAgentOutput = llm.invoke([
+        llm_result: _LLMRevisionResponse = llm.invoke([
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ])
-        # Ensure pass-through fields are populated
-        result.agent_a_report = agent_a_report
-        result.agent_b_report = agent_b_report
+        result = RevisionAgentOutput(
+            **llm_result.model_dump(),
+            agent_a_report=agent_a_report,
+            agent_b_report=agent_b_report,
+        )
     except Exception as e:
         logger.error("Revision Agent LLM call failed: %s", e)
         # Conservative fallback: skip on error
