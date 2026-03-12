@@ -27,6 +27,7 @@ from src.ai_layer.agent_b.schemas import (
     MomentumResult,
     PriceJumpResult,
     VolumeResult,
+    _LLMAgentBResponse,
 )
 from src.ai_layer.agent_b.tools import (
     check_consistency,
@@ -62,10 +63,10 @@ _SKIP_REPORT_DEFAULTS = {
 
 
 def _make_llm(model: str = DEFAULT_MODEL):
-    """Initialize LangChain LLM with structured output bound."""
+    """Initialize LangChain LLM with slim structured output bound."""
     return init_chat_model(
         model, temperature=0, model_provider=_provider(model)
-    ).with_structured_output(AgentBReport)
+    ).with_structured_output(_LLMAgentBResponse)
 
 
 def _make_revision_llm(model: str = DEFAULT_MODEL):
@@ -97,6 +98,65 @@ def _empty_consistency() -> ConsistencyCheck:
     )
 
 
+def _signal_from_price(result: Optional[PriceJumpResult]):
+    """Convert deterministic PriceJumpResult → SignalBreakdown."""
+    from src.ai_layer.agent_b.schemas import SignalBreakdown
+    if result is None:
+        return _empty_signal_breakdown("Price jump tool skipped.")
+    mag = "none"
+    if result.largest_jump_pp >= 20:
+        mag = "extreme"
+    elif result.largest_jump_pp >= 10:
+        mag = "strong"
+    elif result.largest_jump_pp >= 5:
+        mag = "moderate"
+    elif result.detected:
+        mag = "weak"
+    return SignalBreakdown(
+        detected=result.detected,
+        direction=result.direction,
+        magnitude=mag,
+        timing_quality="good" if result.hours_before_close <= 48 else "acceptable",
+        sustained=result.is_sustained,
+        weight_assigned="high" if result.detected and result.is_sustained else "low",
+        note=f"{result.largest_jump_pp:.1f}pp {result.direction} over {result.best_window_hours}h",
+    )
+
+
+def _signal_from_volume(result: Optional[VolumeResult]):
+    """Convert deterministic VolumeResult → SignalBreakdown."""
+    from src.ai_layer.agent_b.schemas import SignalBreakdown
+    if result is None or result.mode == "unavailable":
+        return _empty_signal_breakdown("Volume data unavailable.")
+    return SignalBreakdown(
+        detected=result.spike_detected,
+        direction="UP" if result.spike_detected else "NONE",
+        magnitude="strong" if result.spike_detected and (result.spike_ratio or 0) >= 5 else
+                  "moderate" if result.spike_detected else "none",
+        timing_quality="good",
+        sustained=result.pattern == "sustained" if result.pattern else False,
+        weight_assigned="medium" if result.spike_detected else "low",
+        note=result.note[:80],
+    )
+
+
+def _signal_from_momentum(result: Optional[MomentumResult]):
+    """Convert deterministic MomentumResult → SignalBreakdown."""
+    from src.ai_layer.agent_b.schemas import SignalBreakdown
+    if result is None:
+        return _empty_signal_breakdown("Momentum tool skipped.")
+    detected = result.dominant_direction in ("UP", "DOWN")
+    return SignalBreakdown(
+        detected=detected,
+        direction=result.dominant_direction if detected else "NONE",
+        magnitude="moderate" if result.consistency == "trending" else "weak",
+        timing_quality="good" if result.consistency == "trending" else "acceptable",
+        sustained=result.consistency == "trending",
+        weight_assigned="medium" if detected else "low",
+        note=f"{result.dominant_direction} {result.consistency} {result.acceleration}",
+    )
+
+
 def agent_b_initial(
     package: AgentBInputPackage,
     params: AgentBParams,
@@ -121,7 +181,6 @@ def agent_b_initial(
     assessment = assess_inputs(package, params)
     tools_run: list[str] = []
     tools_skipped: list[str] = list(assessment.skipped_tools)
-
     # 2. Price jump detector
     price_result: Optional[PriceJumpResult] = None
     if assessment.can_run_price_jump:
@@ -136,7 +195,6 @@ def agent_b_initial(
         except Exception as e:
             logger.warning("price_jump_detector failed: %s", e)
             tools_skipped.append("price_jump_detector")
-
     # 3. Volume spike checker
     volume_result: Optional[VolumeResult] = None
     if assessment.can_run_volume:
@@ -148,7 +206,6 @@ def agent_b_initial(
         except Exception as e:
             logger.warning("volume_spike_checker failed: %s", e)
             tools_skipped.append("volume_spike_checker")
-
     # 4. Momentum analyzer
     momentum_result: Optional[MomentumResult] = None
     if assessment.can_run_momentum:
@@ -163,7 +220,6 @@ def agent_b_initial(
         except Exception as e:
             logger.warning("momentum_analyzer failed: %s", e)
             tools_skipped.append("momentum_analyzer")
-
     # 5. Consistency check (only if at least one tool ran)
     consistency: Optional[ConsistencyCheck] = None
     if price_result is not None or momentum_result is not None:
@@ -198,13 +254,12 @@ def agent_b_initial(
     )
 
     try:
-        report: AgentBReport = llm.invoke([
+        llm_out: _LLMAgentBResponse = llm.invoke([
             {"role": "system", "content": AGENT_B_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ])
     except Exception as e:
         logger.error("Agent B LLM call failed: %s", e)
-        # Return a safe default rather than crashing the pipeline
         return AgentBReport(
             **_SKIP_REPORT_DEFAULTS,
             price_jump_assessment=_empty_signal_breakdown("LLM call failed."),
@@ -217,11 +272,23 @@ def agent_b_initial(
             data_quality_notes=assessment.data_quality_notes,
         )
 
-    # 8. Patch audit fields (LLM may not fill these correctly)
-    report.evaluation_date = package.evaluation_date.isoformat()
-    report.tools_run = tools_run
-    report.tools_skipped = tools_skipped
-    report.data_quality_notes = assessment.data_quality_notes
+    # 8. Assemble full report: LLM reasoning + deterministic tool results
+    report = AgentBReport(
+        signal_direction=llm_out.signal_direction,
+        behavior_score=llm_out.behavior_score,
+        confidence=llm_out.confidence,
+        key_findings=llm_out.key_findings,
+        reasoning=llm_out.reasoning,
+        context_for_other_agents=llm_out.context_for_other_agents,
+        price_jump_assessment=_signal_from_price(price_result),
+        volume_assessment=_signal_from_volume(volume_result),
+        momentum_assessment=_signal_from_momentum(momentum_result),
+        consistency=consistency or _empty_consistency(),
+        evaluation_date=package.evaluation_date.isoformat(),
+        tools_run=tools_run,
+        tools_skipped=tools_skipped,
+        data_quality_notes=assessment.data_quality_notes,
+    )
 
     logger.debug(
         "Agent B initial: market=%s score=%d direction=%s confidence=%s",

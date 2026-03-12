@@ -1,4 +1,14 @@
-"""Run the insider risk classification pipeline via LangGraph."""
+"""
+Run the insider risk classification pipeline via LangGraph.
+
+Requires market data files that are NOT included in the repo.
+Download them first:
+
+    python -c "from src.data_layer.download_sample import main; main()"
+
+This will populate data/exports/ with the required CSV/parquet files.
+See README.md for details.
+"""
 
 import sys
 from pathlib import Path
@@ -6,6 +16,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import logging
 logging.basicConfig(level=logging.WARNING)
+
+# ── Check that input data exists before proceeding ───────────────────
+ROOT = Path(__file__).resolve().parent.parent
+REQUIRED_FILES = [
+    ROOT / "data" / "exports" / "polymarket_all_sample.csv",
+]
+
+missing = [f for f in REQUIRED_FILES if not f.exists()]
+if missing:
+    print("ERROR: Required data files not found:\n")
+    for f in missing:
+        print(f"  {f.relative_to(ROOT)}")
+    print(
+        "\nThese files are not included in the repo — you need to download"
+        " market data first:\n"
+        "\n  python -c \"from src.data_layer.download_sample import main; main()\"\n"
+        "\nThis fetches live market data from Polymarket/Kalshi and saves it"
+        " to data/exports/.\n"
+        "See README.md for details."
+    )
+    sys.exit(1)
 
 from src.graph import build_classification_graph
 

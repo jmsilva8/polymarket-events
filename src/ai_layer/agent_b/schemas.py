@@ -114,8 +114,18 @@ class SignalBreakdown(BaseModel):
     note: str  # one sentence, numbers only
 
 
+class _LLMAgentBResponse(BaseModel):
+    """Slim schema for the LLM call — only fields the LLM must reason about."""
+    signal_direction: Literal["YES", "NO", "SKIP"]
+    behavior_score: int                              # 1–10 integer
+    confidence: Literal["low", "medium", "high"]
+    key_findings: list[str]
+    reasoning: str
+    context_for_other_agents: str
+
+
 class AgentBReport(BaseModel):
-    """Initial report — produced by agent_b_initial()."""
+    """Full report — LLM fields + deterministic tool results attached after."""
     signal_direction: Literal["YES", "NO", "SKIP"]
     behavior_score: int                              # 1–10 integer
     confidence: Literal["low", "medium", "high"]
@@ -126,11 +136,11 @@ class AgentBReport(BaseModel):
     key_findings: list[str]
     reasoning: str
     context_for_other_agents: str
-    # Audit fields
-    evaluation_date: str
-    tools_run: list[str]
-    tools_skipped: list[str]
-    data_quality_notes: list[str]
+    # Audit fields — set by Python, not LLM
+    evaluation_date: str = ""
+    tools_run: list[str] = []
+    tools_skipped: list[str] = []
+    data_quality_notes: list[str] = []
 
 
 class AgentBRevisionResponse(BaseModel):

@@ -173,34 +173,49 @@ def _extract_decision(llm_response: str, current_price: float) -> dict:
         "edge_assessment": "not meaningful",
     }
 
-    text = llm_response
+    # Strip markdown formatting so regexes match cleanly
+    text = re.sub(r'\*{1,2}', '', llm_response)   # remove * and **
+    text = re.sub(r'#{1,4}\s*', '', text)          # remove ### headers
 
-    # Decision: look for explicit GO signal
-    if re.search(r'\bdecision\s*[=:]\s*["\']?GO["\']?', text, re.IGNORECASE):
-        result["decision"] = "GO"
-    elif re.search(r'\bfinal decision\b.{0,30}\bGO\b', text, re.IGNORECASE):
-        result["decision"] = "GO"
-    elif re.search(r'\bRECOMMEND\s+(?:INVEST|GO)\b', text, re.IGNORECASE):
-        result["decision"] = "GO"
+    # Decision: look for explicit GO/INVEST signal
+    go_patterns = [
+        r'\bdecision\s*[=:]\s*["\']?GO["\']?',            # decision = GO / decision: GO
+        r'\bfinal decision\b.{0,30}\bGO\b',               # final decision...GO
+        r'\bRECOMMEND\s+(?:INVEST|GO)\b',                  # RECOMMEND INVEST
+        r'\baction\s*[=:*]+\s*(?:INVEST|GO)\b',            # Action: INVEST / Action:** INVEST
+        r'\bdecision\s*[=:*]+\s*["\']?INVEST["\']?',       # decision: INVEST
+        r'\b(?:INVEST|GO)\s*[—–-]\s',                      # INVEST — or GO —
+    ]
+    for pattern in go_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            result["decision"] = "GO"
+            break
 
     # Bet direction — only meaningful if GO
     if result["decision"] == "GO":
-        yes_pos = text.upper().find("BET_DIRECTION: YES") if "BET_DIRECTION" in text.upper() else -1
-        no_pos = text.upper().find("BET_DIRECTION: NO") if "BET_DIRECTION" in text.upper() else -1
-        if yes_pos >= 0 and (no_pos < 0 or yes_pos < no_pos):
-            result["bet_direction"] = "YES"
-        elif no_pos >= 0:
-            result["bet_direction"] = "NO"
+        yes_patterns = [
+            r'BET_DIRECTION\s*[=:*]+\s*YES',
+            r'\bbet\s+(?:direction[:\s]+)?YES\b',
+            r'\bbuy\s+YES\b',
+            r'\bdirection\s*[=:*]+\s*YES\b',
+            r'\bINVEST\s+(?:on\s+)?YES\b',
+        ]
+        no_patterns = [
+            r'BET_DIRECTION\s*[=:*]+\s*NO',
+            r'\bbet\s+(?:direction[:\s]+)?NO\b',
+            r'\bbuy\s+NO\b',
+            r'\bdirection\s*[=:*]+\s*NO\b',
+            r'\bINVEST\s+(?:on\s+)?NO\b',
+        ]
+        for pattern in yes_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                result["bet_direction"] = "YES"
+                break
         else:
-            # Fall back: look for "bet on YES / bet on NO"
-            if re.search(r'\bbet\s+(?:direction[:\s]+)?YES\b', text, re.IGNORECASE):
-                result["bet_direction"] = "YES"
-            elif re.search(r'\bbet\s+(?:direction[:\s]+)?NO\b', text, re.IGNORECASE):
-                result["bet_direction"] = "NO"
-            elif re.search(r'\bbuy YES\b', text, re.IGNORECASE):
-                result["bet_direction"] = "YES"
-            elif re.search(r'\bbuy NO\b', text, re.IGNORECASE):
-                result["bet_direction"] = "NO"
+            for pattern in no_patterns:
+                if re.search(pattern, text, re.IGNORECASE):
+                    result["bet_direction"] = "NO"
+                    break
 
     # Weights
     m = re.search(r'[Ww]eight\s+[Aa]gent\s+A\s+(?:at\s+)?(\d+)\s*%', text)

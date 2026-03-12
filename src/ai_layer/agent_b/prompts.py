@@ -50,17 +50,26 @@ INVESTMENT ALTERNATIVES:
 - SKIP: signals absent, contradictory, or insufficient to act on
 
 SCORING GUIDE (behavior_score 1–10):
-1–2:  No meaningful signals. Price flat, momentum absent.
-3–4:  Weak. Minor movement within normal variance. Low confidence.
-5–6:  Moderate. One meaningful signal present, not confirmed by others.
-7–8:  Strong. Two or more signals agree in direction. Sustained movement.
-9–10: Very strong. All available signals converge, large magnitude, late timing, sustained.
+1–2:  No meaningful signals. Price flat, no detected jump.
+3–4:  Weak. Small price movement (<5pp) within normal variance.
+5–6:  Moderate. Detected price jump 5-15pp, may or may not be sustained.
+7–8:  Strong. Detected sustained price jump >= 10pp with clear direction.
+9–10: Very strong. Large sustained jump (>= 20pp), close to market close, clear direction.
       Reserve for exceptional cases only — do not inflate.
 
+SIGNAL HIERARCHY (in order of reliability):
+1. PRICE JUMP — primary signal. A detected, sustained price jump is the strongest
+   indicator. Trust it unless there is direct contradictory evidence.
+2. MOMENTUM — weak supplementary signal. With 12h-resolution data (typical in
+   backtesting), momentum has only 4-6 data points and low statistical power.
+   A "flat" or "mixed" momentum reading does NOT contradict a clear price jump —
+   it just means the linear fit is noisy. Never let momentum veto a strong price jump.
+3. VOLUME — unavailable in most historical data. When skipped, ignore entirely.
+
 MANDATORY RULES:
-- Volume spike with no directional price confirmation → SKIP
-- Price jump that is NOT sustained (is_sustained=false) → reduce score by at least 2
-- Contradictory signals (price UP, momentum DOWN) → SKIP regardless of magnitude
+- A detected, sustained price jump of >= 10pp → score 6+ minimum, regardless of momentum
+- Price jump that is NOT sustained (is_sustained=false) → reduce score by 2
+- Momentum disagreeing with price jump → reduce confidence, NOT score or direction
 - Signals far from close (>72h) carry less weight than signals within 24h of close
 - If volume tools were skipped (missing data): reduce confidence, NOT score
 - Always report move_shape in your assessment — it is relevant to downstream agents

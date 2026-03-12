@@ -7,7 +7,16 @@ __pycache__/
 # Environment / secrets
 .env
 
-# Data (cached API responses, exports, reports)
+# Data (cached API responses, exports, reports, backtest results)
 data/cache/
 data/exports/
+data/backtest/
 reports/
+
+# Databases
+*.db
+
+# Demo dataset — self-contained 100-market subset (committed intentionally)
+!demo/data/exports/
+!demo/data/backtest/
+!demo/data/price_history.db
